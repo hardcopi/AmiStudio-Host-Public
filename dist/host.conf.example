@@ -1,0 +1,54 @@
+# AmiStudio Host configuration: ~/.config/amistudio-host/host.conf
+# Same style as the AmiStudio release manifest: "key value", '#' comments, "service NAME" starts a block.
+# Command-line options (--lan, --port, --name ...) override these settings.
+
+# name shown on the Amiga (default: this computer's name)
+#name odin
+
+# yes = listen on all interfaces so real Amigas on the LAN can connect (they must pair first);
+# no  = this computer only (an emulator such as WinUAE/FS-UAE/Amiberry with bsdsocket)
+lan yes
+#port 9220
+#discovery yes          # answer the launcher's LAN search (UDP 9220)
+#update_check yes       # look for a newer Host in hardcopi/AmiStudio-Releases once a day
+
+# hosts the fetch service may download from for the Amiga (https only). "*" allows any https host.
+#fetch_allow github.com raw.githubusercontent.com objects.githubusercontent.com release-assets.githubusercontent.com codeload.github.com
+#fetch_max_mb 64
+
+# --- service backends -------------------------------------------------------------------------------------
+# The release tarball's engine/ folder (AmiSurf's browser engine + Chromium) is mounted as "browser" by itself.
+#bundled_browser yes    # no = do not mount it (then define your own service browser below, or none)
+#browser_idle 30        # minutes without AmiSurf before the engine quits (0 = never); restarted on demand
+#bundled_amidiscord yes # the same engine in app mode as "amidiscord" (AmiDiscord: discord.com/app, own Chrome profile)
+#amidiscord_idle 30     # minutes Chrome stays up (logged in, still notifying) after the last AmiDiscord client (0 = never)
+#data_dir /path        # {state} for services (default ~/.local/share/amistudio-host): browser/, amidiscord/ live here
+#exit_idle 0            # stop the Host after N minutes with no client connection open or opened (0 = never);
+                        # any connection counts, including the launcher's status checks
+#allow_quit yes         # 0.1.6+: honour the launcher's quit-when-unused request (control service, docs/PROTOCOL.md);
+                        # no (or --no-remote-quit) for an always-on Host, e.g. the systemd service serving real Amigas
+#
+# --- Google Drive (amidrive, 0.1.8; docs/SERVICES.md "Google Drive") ---------------------------------------
+# Needs fuse3 on the PC. Sign in with `amistudio-hostd amidrive signin` (or AmiDrive), then AmiDrive/the launcher mount it.
+#amidrive yes                     # no = no amidrive service
+#amidrive_mountpoint "/home/me/Google Drive"   # default {state}/amidrive/Google Drive; quote paths with spaces
+#amidrive_automount yes           # mount when AmiStudio or AmiDrive starts (never at Host start)
+#amidrive_keeps_host no           # yes = a mount alone keeps the Host running (no quit-when-unused / exit_idle)
+#amidrive_stop_timeout 60         # seconds to upload pending files when the Host stops, then unmount anyway
+#amidrive_retry 60                # seconds between automount retries after a network failure
+#amidrive_auth_timeout 600        # sign-in timeout in seconds
+#amidrive_flags --vfs-cache-max-size 4G   # extra/overriding rclone mount flags (--drive-use-trash stays on)
+#amidrive_rclone /usr/bin/rclone  # default: engine/rclone/rclone from the release tarball
+#amidrive_client_id ...           # Google OAuth client (the release tarball's host-defaults.conf has AmiStudio's);
+#amidrive_client_secret ...       #   both empty = rclone's built-in client
+#
+# AmiStudio Browser's Linux host (asb-chromed from the Browser's asb-chromed-<ver>-linux-x86_64.tar.gz).
+# NOTE: Browser 0.81 and older connect to plain ASBC on 9223, not to ASH on 9220. compat_port keeps them working
+# through the Host: stop the old run-host.sh first, and give the Browser TOKEN=<your paired Host token> on the LAN.
+#
+#service browser
+#proto 2
+#exec /opt/amistudio/asb-chromed -port {port} -token {token} -idle 0
+#handshake asbc2
+#compat_port 9223
+#log browser.log

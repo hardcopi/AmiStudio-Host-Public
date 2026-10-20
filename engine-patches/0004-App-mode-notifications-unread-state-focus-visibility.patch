@@ -1,0 +1,449 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: "Grok Bot (for Rich)" <hardcopi@users.noreply.github.com>
+Date: Sat, 17 Oct 2026 23:08:00 -0400
+Subject: [PATCH] App mode: notifications, unread state, focus/visibility
+ (appnotify.inc)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+A preload shim (main world, allowlisted origins only) replaces
+window.Notification and ServiceWorkerRegistration.showNotification and
+reports notifications (title, body, tag, data.url, a <=64x64 RGB icon) and
+the main frame's title/favicon (MutationObserver on <head> only) to a
+binding. No Runtime.enable: the binding has a random name, is re-added on
+every frame navigation and taken off window by the shim at once; every
+message carries a per-run key. Notification permission is granted for
+the app's origins.
+
+Unread state comes from a title pattern table ('(N) ', '• ') and a
+favicon change; logged, debounced to 2/s. 'cmd app focus F V' makes the
+page unfocused/hidden (focus emulation, hasFocus, visibilityState,
+events); hidden stops the screencast and all frames while the page and
+its notifications keep running. No client = unfocused and hidden.
+'cmd app notifyact ID 0|1' clicks/dismisses a notification.
+
+Everything is gated on ASB_APP; AmiSurf mode is unchanged.
+---
+ Makefile             |   4 +-
+ chrome/appmode.inc   |  11 +-
+ chrome/appnotify.inc | 276 +++++++++++++++++++++++++++++++++++++++++++
+ chrome/host.c        |   8 +-
+ 4 files changed, 293 insertions(+), 6 deletions(-)
+ create mode 100644 chrome/appnotify.inc
+
+diff --git a/Makefile b/Makefile
+index 4faf00d..45088e0 100644
+--- a/Makefile
++++ b/Makefile
+@@ -23,7 +23,7 @@ amiga: $(AMIGA_BINS)
+ chrome-host: build/host/asb-chromed
+ sdl: build/host/asb-sdl
+ 
+-build/host/asb-chromed: chrome/host.c chrome/features.inc chrome/frames.inc chrome/bidi.inc chrome/audio.inc chrome/appmode.inc $(PROTO)
++build/host/asb-chromed: chrome/host.c chrome/features.inc chrome/frames.inc chrome/bidi.inc chrome/audio.inc chrome/appmode.inc chrome/appnotify.inc $(PROTO)
+ 	@mkdir -p $(@D); $(HOSTCC) $(HOSTCFLAGS) -o $@ chrome/host.c chrome/asbc.c -lcrypto -lm
+ build/host/asb-sdl: ui/asb_sdl_chrome.c $(PROTO)
+ 	@mkdir -p $(@D); $(HOSTCC) $(HOSTCFLAGS) -I/usr/include/SDL2 -o $@ ui/asb_sdl_chrome.c chrome/asbc.c -lSDL2 -lSDL2_ttf -lm
+@@ -66,7 +66,7 @@ clean:
+ .PHONY: all host amiga chrome-host sdl test lha clean
+ 
+ # static asb-chromed (AmiKit bundle; also a portable engine for the AmiStudio Host's "browser" service)
+-build/static/asb-chromed: chrome/host.c chrome/features.inc chrome/frames.inc chrome/bidi.inc chrome/audio.inc chrome/appmode.inc $(PROTO)
++build/static/asb-chromed: chrome/host.c chrome/features.inc chrome/frames.inc chrome/bidi.inc chrome/audio.inc chrome/appmode.inc chrome/appnotify.inc $(PROTO)
+ 	@mkdir -p $(@D); $(HOSTCC) -O2 -std=gnu99 -pthread -static -o $@ chrome/host.c chrome/asbc.c -lcrypto -lz -lzstd -lm 2>&1 | grep -v "warning: Using" || true; test -x $@
+ # 0.82: the own Linux host package (asb-chromed-<ver>-linux-x86_64.tar.gz, dist/host/) is retired; the AmiStudio Host
+ # runs asb-chromed (docs/HOST.md). The last one is asb-chromed-0.77-linux-x86_64.tar.gz.
+diff --git a/chrome/appmode.inc b/chrome/appmode.inc
+index bcb3779..37d5045 100644
+--- a/chrome/appmode.inc
++++ b/chrome/appmode.inc
+@@ -29,6 +29,8 @@ static int g_app_ext;                     /* 0 client (OPENURL), 1 deny */
+ static int g_rm=1, g_rm_small_ms=100, g_rm_big_ms=1000, g_app_dark, g_app_mute=1;
+ static int g_app_fetch_on;                /* Fetch.enable done on this tab */
+ static void app_bws_open(void);
++static int app_notify_event(const char *method,const char *msg); static void app_shim_install(void); static void app_grant(void);
++static void app_focus(int f,int v); static void app_notify_act(uint32_t id,int action); static void app_unread_tick(void);
+ 
+ static const char *APP_DEFAULT_ALLOW="discord.com,*.discord.com,discordapp.com,*.discordapp.com,*.discordapp.net,"
+   "discord.gg,*.discord.gg,discord.new,*.hcaptcha.com,hcaptcha.com";
+@@ -93,6 +95,7 @@ static void app_enable(void){
+   /* top-level documents are checked before they load (Fetch, request stage, documents only) */
+   int i=cdp_id(); cdp("{\"id\":%d,\"method\":\"Fetch.enable\",\"params\":{\"patterns\":[{\"urlPattern\":\"*\",\"resourceType\":\"Document\",\"requestStage\":\"Request\"}]}}",i);
+   g_app_fetch_on=1;
++  app_shim_install();
+   app_bws_open(); }
+ 
+ /* ---- new windows: window.open / target=_blank ----
+@@ -112,7 +115,8 @@ static void app_bws_open(void){
+   if(!http_get(g_dbg,"/json/version",&r) && r.p) json_str(r.p,"webSocketDebuggerUrl",u,sizeof u);
+   free(r.p);
+   if(!u[0] || (g_bws=ws_open(u))<0){ g_bws=-1; fprintf(stderr,"asb-chromed: app: browser endpoint not reachable, new windows are not caught\n"); return; }
+-  bcdp("{\"id\":%d,\"method\":\"Target.setAutoAttach\",\"params\":{\"autoAttach\":true,\"waitForDebuggerOnStart\":true,\"flatten\":true,\"filter\":[{\"type\":\"page\",\"exclude\":false}]}}",cdp_id()); }
++  bcdp("{\"id\":%d,\"method\":\"Target.setAutoAttach\",\"params\":{\"autoAttach\":true,\"waitForDebuggerOnStart\":true,\"flatten\":true,\"filter\":[{\"type\":\"page\",\"exclude\":false}]}}",cdp_id());
++  app_grant(); }
+ static void app_bws_close(void){ if(g_bws>=0){ close(g_bws); g_bws=-1; } g_npop=0; }
+ static void pop_drop(int k){ g_pop[k]=g_pop[--g_npop]; }
+ static void app_bws_msg(const char *msg){
+@@ -187,6 +191,8 @@ static int app_cmd(char *c,char *arg){
+     if(!strcmp(arg,"home")) cdp_nav(g_app_url);
+     else if(!strcmp(arg,"reducedmotion")) app_set_rm(atoi(v));
+     else if(!strcmp(arg,"logout")) app_logout();
++    else if(!strcmp(arg,"focus")){ int f=1,vv=1; sscanf(v,"%d %d",&f,&vv); app_focus(f,vv); }
++    else if(!strcmp(arg,"notifyact")){ unsigned id=0; int ac=0; sscanf(v,"%u %d",&id,&ac); app_notify_act(id,ac); }
+     else fprintf(stderr,"asb-chromed: app: unknown command app %s\n",arg);
+     return 1; }
+   fprintf(stderr,"asb-chromed: app mode: cmd %s ignored\n",c); return 1; }
+@@ -200,6 +206,7 @@ static int app_nav(const char *u){
+ /* CDP events/replies for app mode; returns 1 if consumed */
+ static int app_event(const char *method,const char *msg){
+   if(!g_app) return 0;
++  if(app_notify_event(method,msg)) return 1;
+   if(!strcmp(method,"Fetch.requestPaused")){
+     char rid[120]="", fid[80]="", url[2400]=""; json_str(msg,"requestId",rid,sizeof rid); json_str(msg,"frameId",fid,sizeof fid);
+     { const char *r=strstr(msg,"\"request\""); json_str(r?r:msg,"url",url,sizeof url); }
+@@ -243,7 +250,7 @@ static void app_logout(void){
+ /* every main-loop pass (20 ms) */
+ static void app_tick(void){
+   if(!g_app) return;
+-  app_hold_flush();
++  app_hold_flush(); app_unread_tick();
+   long long t=now_ms();
+   for(int k=0;k<g_npop;k++) if(t-g_pop[k].t>8000){ fprintf(stderr,"asb-chromed: app: empty new window closed\n");
+     bcdp("{\"id\":%d,\"method\":\"Target.closeTarget\",\"params\":{\"targetId\":\"%s\"}}",cdp_id(),g_pop[k].tid); pop_drop(k); k--; }
+diff --git a/chrome/appnotify.inc b/chrome/appnotify.inc
+new file mode 100644
+index 0000000..b8f2746
+--- /dev/null
++++ b/chrome/appnotify.inc
+@@ -0,0 +1,276 @@
++/* appnotify.inc - app mode (ASB_APP) notifications, unread state and focus/visibility, for AmiDiscord.
++   Included by host.c after appmode.inc; nothing runs unless ASB_APP is set.
++
++   Sources (no DOM scraping):
++   - the Notification API: a small preload script (Page.addScriptToEvaluateOnNewDocument, main world, allowlisted
++     origins only) replaces window.Notification and ServiceWorkerRegistration.showNotification with a shim that
++     reports to the "asbNotify" binding; notification permission is granted up front for the app's origins;
++   - the main frame's <title> and favicon <link> (the page's own metadata, watched by a MutationObserver on <head>):
++     Discord puts "(N) " (N = mentions + unread DMs) or a "• " (unread without mention) in front of its title, and
++     swaps the favicon when it has unread mentions.
++   Binding: random name per run, added again on every Page.frameNavigated (no Runtime.enable); the shim takes it off
++   window at once and prefixes every message with the per-run key, so other frames cannot fake notifications.
++   The shim reports JSON arrays (after the key): ["hello",top,origin], ["show",id,title,body,tag,url,icon], ["close",id],
++   ["meta",title,favicon href]; icon = "WxH:" + base64 RGB24 (<= 64x64, on white) or "".
++   The Host talks back with a CustomEvent whose name is a random per-run key: ["focus",f,v], ["click",id],
++   ["dismiss",id].
++
++   Focus/visibility: Discord only notifies when its window is not focused or hidden. app_focus(f,v) makes the page
++   believe it (Emulation.setFocusEmulationEnabled, document.hasFocus / visibilityState / hidden, focus, blur and
++   visibilitychange events). visible=0 also stops the screencast: no frames go out while the client's window is
++   iconified, but the page keeps running, so notifications and unread changes keep coming. With no client the page
++   is unfocused and hidden (so Discord notifies and does not mark messages read); a new client starts focused and
++   visible until it says otherwise ("cmd app focus F V", ASBC_FOCUS). */
++
++static const char APP_SHIM[] =
++  "(function(){\n"
++  "var K=\"@KEY@\", BN=\"@BIND@\", A=@ALLOW@, B=null, Q=[], tries=0;\n"
++  "function grab(){ var f=window[BN]; if(typeof f===\"function\"){ try{ delete window[BN]; }catch(e){} if(!B){ B=f; while(Q.length){ try{ B(Q.shift()); }catch(e){} } } } return !!B; }\n"
++  "(function w(){ if(!grab() && tries++<500) setTimeout(w,20); })();\n"
++  "var h=location.hostname.toLowerCase(), pt=location.port, hp=h+\":\"+pt;\n"
++  "function g(p,x){ return p.slice(0,2)===\"*.\"?(x.length>p.length-1&&x.slice(1-p.length)===p.slice(1)):p===x; }\n"
++  "if(!A.some(function(p){ return p.indexOf(\":\")>=0?(pt&&g(p,hp)):g(p,h); })) return;\n"
++  "function post(a){ var s=JSON.stringify([K].concat(a)); if(grab()){ try{ B(s); }catch(e){} } else if(Q.length<50) Q.push(s); }\n"
++  "var top=window===window.top, base=(Math.random()*1e9)|0, seq=0, live={}, F=null, V=null;\n"
++  "function fire(n,t){ var e=new Event(t,{cancelable:true}), f=n[\"on\"+t]; if(typeof f===\"function\"){ try{ f.call(n,e); }catch(x){} } n.dispatchEvent(e); return e.defaultPrevented; }\n"
++  "function icon(u,cb){\n"
++  "  if(!u){ cb(\"\"); return; }\n"
++  "  var done=0, i=new Image(), t=setTimeout(function(){ if(!done){ done=1; cb(\"\"); } },1500);\n"
++  "  i.crossOrigin=\"anonymous\";\n"
++  "  i.onload=function(){ if(done) return; done=1; clearTimeout(t);\n"
++  "    try{ var m=Math.max(i.naturalWidth,i.naturalHeight)||1, s=Math.min(64,m)/m, w=Math.max(1,Math.round(i.naturalWidth*s)), hh=Math.max(1,Math.round(i.naturalHeight*s));\n"
++  "      var c=document.createElement(\"canvas\"); c.width=w; c.height=hh; var x=c.getContext(\"2d\"); x.fillStyle=\"#fff\"; x.fillRect(0,0,w,hh); x.drawImage(i,0,0,w,hh);\n"
++  "      var d=x.getImageData(0,0,w,hh).data, r=[]; for(var k=0;k<d.length;k+=4) r.push(String.fromCharCode(d[k],d[k+1],d[k+2]));\n"
++  "      cb(w+\"x\"+hh+\":\"+btoa(r.join(\"\"))); }catch(e){ cb(\"\"); } };\n"
++  "  i.onerror=function(){ if(!done){ done=1; clearTimeout(t); cb(\"\"); } };\n"
++  "  i.src=u; }\n"
++  "class Notification extends EventTarget{\n"
++  "  constructor(t,o){ super(); if(t===undefined) throw new TypeError(\"Failed to construct 'Notification': 1 argument required, but only 0 present.\");\n"
++  "    o=o||{}; var id=base+(++seq), me=this, url=\"\";\n"
++  "    this.title=String(t); this.body=o.body?String(o.body):\"\"; this.tag=o.tag?String(o.tag):\"\"; this.icon=o.icon?String(o.icon):\"\";\n"
++  "    this.data=o.data===undefined?null:o.data; this.silent=!!o.silent; this.requireInteraction=!!o.requireInteraction;\n"
++  "    this.lang=o.lang||\"\"; this.dir=o.dir||\"auto\"; this.badge=o.badge||\"\"; this.image=o.image||\"\"; this.renotify=!!o.renotify; this.timestamp=Date.now(); this.actions=[];\n"
++  "    this.onclick=this.onclose=this.onshow=this.onerror=null;\n"
++  "    Object.defineProperty(this,\"_asb\",{value:id});\n"
++  "    if(this.tag) for(var k in live){ if(live[k].tag===this.tag){ var old=live[k]; delete live[k]; post([\"close\",+k]); fire(old,\"close\"); } }\n"
++  "    live[id]=this;\n"
++  "    try{ var d=o.data; if(d&&typeof d===\"object\"&&typeof d.url===\"string\") url=d.url; }catch(e){}\n"
++  "    icon(this.icon,function(ic){ if(!live[id]) return; post([\"show\",id,me.title,me.body,me.tag,url,ic]); setTimeout(function(){ fire(me,\"show\"); },0); }); }\n"
++  "  close(){ var id=this._asb; if(live[id]){ delete live[id]; post([\"close\",id]); fire(this,\"close\"); } }\n"
++  "  static get permission(){ return \"granted\"; }\n"
++  "  static requestPermission(cb){ if(typeof cb===\"function\"){ try{ cb(\"granted\"); }catch(e){} } return Promise.resolve(\"granted\"); }\n"
++  "  static get maxActions(){ return 0; }\n"
++  "}\n"
++  "window.Notification=Notification;\n"
++  "if(window.ServiceWorkerRegistration){ var P=ServiceWorkerRegistration.prototype;\n"
++  "  P.showNotification=function(t,o){ new Notification(t,o); return Promise.resolve(); };\n"
++  "  P.getNotifications=function(){ return Promise.resolve(Object.keys(live).map(function(k){ return live[k]; })); }; }\n"
++  "var D=Document.prototype, hf=D.hasFocus;\n"
++  "function getter(n){ var d=Object.getOwnPropertyDescriptor(D,n); return d&&d.get; }\n"
++  "var gv=getter(\"visibilityState\"), gh=getter(\"hidden\"), patched=0;\n"
++  "function patch(){ if(patched) return; patched=1;\n"
++  "  D.hasFocus=function hasFocus(){ return F===null?hf.call(this):F; };\n"
++  "  if(gv) Object.defineProperty(D,\"visibilityState\",{get:function(){ return V===null?gv.call(this):(V?\"visible\":\"hidden\"); },configurable:true,enumerable:true});\n"
++  "  if(gh) Object.defineProperty(D,\"hidden\",{get:function(){ return V===null?gh.call(this):!V; },configurable:true,enumerable:true}); }\n"
++  "function state(f,v){\n"
++  "  var of=F===null?true:F, ov=V===null?true:V;\n"
++  "  patch();\n"
++  "  F=!!f; V=!!v;\n"
++  "  if(ov!==V) document.dispatchEvent(new Event(\"visibilitychange\"));\n"
++  "  if(of!==F) window.dispatchEvent(new Event(F?\"focus\":\"blur\")); }\n"
++  "window.addEventListener(K,function(e){ e.stopImmediatePropagation(); var d=e.detail||[];\n"
++  "  if(d[0]===\"focus\") state(d[1],d[2]);\n"
++  "  else if(d[0]===\"click\"||d[0]===\"dismiss\"){ var n=live[d[1]]; if(!n) return;\n"
++  "    if(d[0]===\"click\") fire(n,\"click\"); else { delete live[d[1]]; fire(n,\"close\"); } } },true);\n"
++  "post([\"hello\",top?1:0,location.origin]);\n"
++  "if(top){ var lt=null, li=null, q=0;\n"
++  "  function meta(){ q=0; var t=document.title, l=document.querySelector(\"link[rel~=icon]\"), u=l?l.href:\"\";\n"
++  "    if(t!==lt||u!==li){ lt=t; li=u; post([\"meta\",t,u]); } }\n"
++  "  function watch(){ meta(); new MutationObserver(function(ms){\n"
++  "      for(var k=0;k<ms.length;k++){ var n=ms[k].target; if(n.nodeType===3) n=n.parentNode;\n"
++  "        if(n===document.head||(n&&(n.nodeName===\"TITLE\"||n.nodeName===\"LINK\"))){ if(!q){ q=1; setTimeout(meta,100); } return; } } })\n"
++  "    .observe(document.head,{childList:true,subtree:true,characterData:true,attributes:true,attributeFilter:[\"href\",\"rel\"]}); }\n"
++  "  if(document.head) watch(); else document.addEventListener(\"DOMContentLoaded\",watch); }\n"
++  "})();\n";
++
++/* title prefixes, tried repeatedly at the start of the title: count = "(N) ", dot = "• " (also without the space).
++   Kept as data: Discord's exact format may change. */
++static const struct { const char *pfx; int kind; } APP_TITLE_PAT[] = {
++  { "(%u) ", 1 }, { "(%u)", 1 }, { "\xE2\x80\xA2 ", 2 }, { "\xE2\x80\xA2", 2 }, { NULL, 0 } };
++
++static char g_app_key[40], g_app_bind[24];   /* random per run: the Host->shim event name (also the shim's token), binding name */
++static int g_app_foc=1;                 /* g_app_vis (host.c) is the visible flag */
++static int g_app_unread[3], g_app_unread_sent[3]={-1,-1,-1};   /* count, mentions, flags (1 dot, 2 favicon badge) */
++static long long g_app_unread_t;
++static char g_app_icon0[600], g_app_iconcur[600];   /* first favicon of the document (the plain one), current one */
++static int g_app_nlogged;
++
++#define APP_NTF 32
++typedef struct { uint32_t id; long long shim; int kind; char tag[128]; } app_ntf;
++static app_ntf g_ntf[APP_NTF]; static int g_nntf; static uint32_t g_ntf_next=1;
++
++static void app_notify_out(uint32_t id,int kind,const char *title,const char *body,const char *tag,const char *hint,const char *url,int iw,int ih,const unsigned char *rgb);
++static void app_notifyclose_out(uint32_t id);
++static void app_unread_out(int count,int mentions,int flags);
++
++static void jsonesc(const char *s,char *o,int cap){   /* JSON string body (no quotes) */
++  int n=0; for(;*s && n<cap-7;s++){ unsigned char c=(unsigned char)*s;
++    if(c=='\\'||c=='"'){ o[n++]='\\'; o[n++]=(char)c; }
++    else if(c=='\n'){ o[n++]='\\'; o[n++]='n'; }
++    else if(c<32){ n+=snprintf(o+n,(size_t)(cap-n),"\\u%04x",c); }
++    else o[n++]=(char)c; }
++  o[n]=0; }
++
++static void app_shim_install(void){
++  if(!g_app || g_bidi) return;
++  if(g_cli<0){ g_app_foc=0; g_app_vis=0; }   /* nobody is looking: unfocused and hidden */
++  if(!g_app_key[0]){ unsigned char r[12]; if(RAND_bytes(r,12)!=1) for(int i=0;i<12;i++) r[i]=(unsigned char)rng32();
++    strcpy(g_app_key,"asb"); for(int i=0;i<12;i++) snprintf(g_app_key+3+i*2,3,"%02x",r[i]);
++    if(RAND_bytes(r,8)!=1) for(int i=0;i<8;i++) r[i]=(unsigned char)rng32();
++    strcpy(g_app_bind,"_"); for(int i=0;i<8;i++) snprintf(g_app_bind+1+i*2,3,"%02x",r[i]); }
++  char allow[APP_MAXALLOW*140]; int o=0; allow[o++]='[';
++  for(int i=0;i<g_app_nallow;i++) o+=snprintf(allow+o,sizeof allow-(size_t)o,"%s\"%s\"",i?",":"",g_app_allow[i]);
++  allow[o++]=']'; allow[o]=0;
++  static char src[sizeof APP_SHIM+sizeof allow+128];
++  const char *k=strstr(APP_SHIM,"@KEY@"), *bn=strstr(APP_SHIM,"@BIND@"), *a=strstr(APP_SHIM,"@ALLOW@");
++  snprintf(src,sizeof src,"%.*s%s%.*s%s%.*s%s%s",(int)(k-APP_SHIM),APP_SHIM,g_app_key,(int)(bn-k-5),k+5,g_app_bind,(int)(a-bn-6),bn+6,allow,a+7);
++  static char esc[sizeof src*2]; jsonesc(src,esc,sizeof esc);
++  cdp("{\"id\":%d,\"method\":\"Runtime.addBinding\",\"params\":{\"name\":\"%s\"}}",cdp_id(),g_app_bind);
++  cdp("{\"id\":%d,\"method\":\"Page.addScriptToEvaluateOnNewDocument\",\"params\":{\"source\":\"%s\",\"runImmediately\":true}}",cdp_id(),esc); }
++
++/* notification (+ clipboard) permission for the app's origins: the start URL's and every exact allowlisted host */
++static void app_grant(void){
++  if(!g_app || g_bws<0) return;
++  char o[400]; origin_of(g_app_url,o,sizeof o);
++  if(o[0]) bcdp("{\"id\":%d,\"method\":\"Browser.grantPermissions\",\"params\":{\"origin\":\"%s\",\"permissions\":[\"notifications\"]}}",cdp_id(),o);
++  for(int i=0;i<g_app_nallow;i++){ if(strchr(g_app_allow[i],'*')) continue;
++    char e[300]; snprintf(e,sizeof e,"https://%.200s",g_app_allow[i]); if(!strcmp(e,o)) continue;
++    bcdp("{\"id\":%d,\"method\":\"Browser.grantPermissions\",\"params\":{\"origin\":\"%s\",\"permissions\":[\"notifications\"]}}",cdp_id(),e); } }
++
++static void app_to_shim(const char *arr){   /* ["focus",1,0] etc. to every allowlisted frame of the page */
++  if(g_ws<0) return;
++  char js[400], esc[600];
++  snprintf(js,sizeof js,"dispatchEvent(new CustomEvent(\"%s\",{detail:%s}))",g_app_key,arr); jsonesc(js,esc,sizeof esc);
++  cdp("{\"id\":%d,\"method\":\"Runtime.evaluate\",\"params\":{\"expression\":\"%s\"}}",cdp_id(),esc); }
++
++static void app_focus(int f,int v){
++  if(!g_app) return;
++  f=f!=0; v=v!=0; int was_v=g_app_vis;
++  g_app_foc=f; g_app_vis=v;
++  cdp("{\"id\":%d,\"method\":\"Emulation.setFocusEmulationEnabled\",\"params\":{\"enabled\":%s}}",cdp_id(),f?"true":"false");
++  char a[40]; snprintf(a,sizeof a,"[\"focus\",%d,%d]",f,v); app_to_shim(a);
++  if(was_v && !v){ if(g_screencast_on) cdp_screencast(0); free(g_hold); g_hold=NULL; }
++  if(!was_v && v && g_cli>=0){ cdp_screencast(1); kick_arm(); }
++  fprintf(stderr,"asb-chromed: app: focus %d visible %d%s\n",f,v,!v?" (no frames; notifications continue)":""); }
++
++/* sequential reader for the shim's JSON arrays */
++static const char *ja_next(const char *p,char *out,int cap){
++  while(*p==' '||*p==','||*p=='[') p++;
++  if(*p=='"'){ char tmp[8]; (void)tmp; int n=0; p++;
++    while(*p && *p!='"'){ char c=*p++;
++      if(c=='\\' && *p){ c=*p++;
++        if(c=='n') c='\n'; else if(c=='t') c='\t'; else if(c=='r') c='\r'; else if(c=='b'||c=='f') c=' ';
++        else if(c=='u' && p[0]&&p[1]&&p[2]&&p[3]){ char h[5]={p[0],p[1],p[2],p[3],0}; unsigned cp=(unsigned)strtoul(h,NULL,16); p+=4;
++          if(cp>=0xD800&&cp<0xDC00&&p[0]=='\\'&&p[1]=='u'){ char l[5]={p[2],p[3],p[4],p[5],0}; unsigned lo=(unsigned)strtoul(l,NULL,16);
++            if(lo>=0xDC00&&lo<0xE000){ cp=0x10000+((cp-0xD800)<<10)+(lo-0xDC00); p+=6; } }
++          unsigned char u[4]; int k=0;
++          if(cp<0x80) u[k++]=(unsigned char)cp;
++          else if(cp<0x800){ u[k++]=(unsigned char)(0xC0|cp>>6); u[k++]=(unsigned char)(0x80|(cp&63)); }
++          else if(cp<0x10000){ u[k++]=(unsigned char)(0xE0|cp>>12); u[k++]=(unsigned char)(0x80|(cp>>6&63)); u[k++]=(unsigned char)(0x80|(cp&63)); }
++          else { u[k++]=(unsigned char)(0xF0|cp>>18); u[k++]=(unsigned char)(0x80|(cp>>12&63)); u[k++]=(unsigned char)(0x80|(cp>>6&63)); u[k++]=(unsigned char)(0x80|(cp&63)); }
++          if(n+k<cap) { memcpy(out+n,u,(size_t)k); n+=k; } continue; } }
++      if(n<cap-1) out[n++]=c; }
++    if(*p=='"') p++; out[n]=0; return p; }
++  int n=0; while(*p && *p!=',' && *p!=']' && n<cap-1) out[n++]=*p++; out[n]=0; return p; }
++
++/* "(3) • Discord | #general" -> count 3, dot */
++static void app_title_unread(const char *t,int *count,int *dot){
++  *count=0; *dot=0;
++  for(int again=1;again;){ again=0;
++    while(*t==' ') t++;
++    for(int i=0;APP_TITLE_PAT[i].pfx;i++){ const char *pf=APP_TITLE_PAT[i].pfx;
++      if(APP_TITLE_PAT[i].kind==1){ unsigned v; int used=0; char fmt[16]; snprintf(fmt,sizeof fmt,"%s%%n",pf);
++        if(sscanf(t,fmt,&v,&used)==1 && used>0 && t[used-1]==pf[strlen(pf)-1]){ *count=(int)(v>65535?65535:v); t+=used; again=1; break; } }
++      else { size_t l=strlen(pf); if(!strncmp(t,pf,l)){ *dot=1; t+=l; again=1; break; } } } } }
++
++static void app_unread_update(const char *title){
++  int c,d; app_title_unread(title,&c,&d);
++  int badge=g_app_icon0[0] && g_app_iconcur[0] && strcmp(g_app_icon0,g_app_iconcur);
++  g_app_unread[0]=c; g_app_unread[1]=c; g_app_unread[2]=(d?1:0)|(badge?2:0); }
++
++/* sends a changed unread state at most twice a second (main loop), and the latest one on reconnect */
++static void app_unread_tick(void){
++  if(!memcmp(g_app_unread,g_app_unread_sent,sizeof g_app_unread) || now_ms()-g_app_unread_t<500) return;
++  memcpy(g_app_unread_sent,g_app_unread,sizeof g_app_unread); g_app_unread_t=now_ms();
++  fprintf(stderr,"asb-chromed: app: unread %d mentions %d flags %d\n",g_app_unread[0],g_app_unread[1],g_app_unread[2]);
++  app_unread_out(g_app_unread[0],g_app_unread[1],g_app_unread[2]); }
++
++static int ntf_find_shim(long long s){ for(int i=0;i<g_nntf;i++) if(g_ntf[i].shim==s) return i; return -1; }
++static int ntf_find(uint32_t id){ for(int i=0;i<g_nntf;i++) if(g_ntf[i].id==id) return i; return -1; }
++static void ntf_drop(int i){ g_ntf[i]=g_ntf[--g_nntf]; }
++
++/* kind 0 channel message, 1 mention, 2 DM, 3 call, 255 other; hint = "#channel, Server" from "user (#channel, Server)" */
++static int app_kind(const char *title,const char *body,char *hint,int cap){
++  hint[0]=0;
++  const char *o=strstr(title," (#"); const char *e=o?strrchr(o,')'):NULL;
++  if(o && e && e>o+2){ int n=(int)(e-(o+2)); if(n>cap-1) n=cap-1; memcpy(hint,o+2,(size_t)n); hint[n]=0; }
++  if(strcasestr(body,"incoming call")||strcasestr(title,"incoming call")||strcasestr(body,"is calling")) return 3;
++  if(o) return strstr(body,"@")?1:0;
++  return title[0]?2:255; }
++
++static void app_shim_msg(const char *pl){
++  static char a[9][16384]; const char *p=pl; int n=0;
++  while(*p && *p!=']' && n<9){ p=ja_next(p,a[n],(int)sizeof a[0]); n++; while(*p==' ') p++; if(*p!=',' && *p!=']') break; }
++  if(n<2 || strcmp(a[0],g_app_key)) return;   /* not from our shim (the binding is visible to the page briefly) */
++  memmove(a[0],a[1],sizeof a[0]*(size_t)(n-1)); n--;   /* drop the token */
++  if(!strcmp(a[0],"hello")){ char s[40]; if(n>=2 && atoi(a[1])){ g_app_icon0[0]=0;   /* new top document: next favicon is the plain one */
++      static char lasto[200]; if(n>=3 && strcmp(lasto,a[2])){ scopy(lasto,sizeof lasto,a[2]); fprintf(stderr,"asb-chromed: app: notification shim active on %.150s\n",a[2]); } } snprintf(s,sizeof s,"[\"focus\",%d,%d]",g_app_foc,g_app_vis); app_to_shim(s); return; }
++  if(!strcmp(a[0],"meta") && n>=3){
++    scopy(g_app_iconcur,sizeof g_app_iconcur,a[2]); if(!g_app_icon0[0]) scopy(g_app_icon0,sizeof g_app_icon0,a[2]);
++    if(strcmp(g_title,a[1]) && a[1][0]){ scopy(g_title,sizeof g_title,a[1]); send_meta(); }
++    app_unread_update(a[1]); return; }
++  if(!strcmp(a[0],"close") && n>=2){ int i=ntf_find_shim(atoll(a[1])); if(i<0) return;
++    uint32_t id=g_ntf[i].id; ntf_drop(i);
++    fprintf(stderr,"asb-chromed: app: notification %u closed by the page\n",id); app_notifyclose_out(id); return; }
++  if(!strcmp(a[0],"show") && n>=7){
++    if(g_nntf==APP_NTF) ntf_drop(0);
++    app_ntf *t=&g_ntf[g_nntf++]; t->id=g_ntf_next++; if(!g_ntf_next) g_ntf_next=1; t->shim=atoll(a[1]); scopy(t->tag,sizeof t->tag,a[4]);
++    char hint[200]; t->kind=app_kind(a[2],a[3],hint,sizeof hint);
++    static unsigned char rgb[64*64*3]; int iw=0, ih=0;
++    if(a[6][0] && sscanf(a[6],"%dx%d:",&iw,&ih)==2 && iw>0 && ih>0 && iw<=64 && ih<=64){
++      const char *b=strchr(a[6],':')+1; if(b64dec(b,(int)strlen(b),rgb,(int)sizeof rgb)!=iw*ih*3) iw=ih=0; }
++    else iw=ih=0;
++    if(g_app_nlogged++<200) fprintf(stderr,"asb-chromed: app: notification %u kind %d \"%.80s\" tag \"%.60s\"%s%s icon %dx%d%s\n",t->id,t->kind,a[2],a[4],
++      hint[0]?" in ":"",hint,iw,ih,g_cli<0?" (no client, dropped)":"");
++    app_notify_out(t->id,t->kind,a[2],a[3],a[4],hint,a[5],iw,ih,rgb); return; } }
++
++/* the client clicked (action 0) or dismissed (1) a notification */
++static void app_notify_act(uint32_t id,int action){
++  int i=ntf_find(id); if(i<0){ fprintf(stderr,"asb-chromed: app: notification %u is gone\n",id); return; }
++  char s[80]; snprintf(s,sizeof s,"[\"%s\",%lld]",action?"dismiss":"click",g_ntf[i].shim);
++  fprintf(stderr,"asb-chromed: app: notification %u %s\n",id,action?"dismissed":"clicked");
++  if(!action){ app_focus(1,1); }   /* the client brings its window to the front */
++  app_to_shim(s); ntf_drop(i); }
++
++static int app_notify_event(const char *method,const char *msg){
++  /* without Runtime.enable (kept off: pages can detect it) a binding only reaches documents that exist when it is
++     added, so it is added again whenever a frame navigates; the shim waits for it */
++  if(!strcmp(method,"Page.frameNavigated")){ cdp("{\"id\":%d,\"method\":\"Runtime.addBinding\",\"params\":{\"name\":\"%s\"}}",cdp_id(),g_app_bind); return 0; }
++  if(!strcmp(method,"Runtime.bindingCalled")){
++    char name[40]=""; json_str(msg,"name",name,sizeof name); if(strcmp(name,g_app_bind)) return 0;
++    static char pl[60000]; if(json_str(msg,"payload",pl,sizeof pl)) app_shim_msg(pl);
++    return 1; }
++  return 0; }
++
++/* app-mode client lifecycle */
++static void app_client_hello(void){   /* before HELLO starts the screencast */
++  if(!g_app) return; g_app_foc=1; g_app_vis=1;
++  cdp("{\"id\":%d,\"method\":\"Emulation.setFocusEmulationEnabled\",\"params\":{\"enabled\":true}}",cdp_id());
++  app_to_shim("[\"focus\",1,1]"); memset(g_app_unread_sent,0xff,sizeof g_app_unread_sent); g_app_unread_t=0; }
++static void app_client_gone(void){ if(!g_app) return; app_focus(0,0); }
++
++/* ---- to the client (M4 sends these as ASBC messages when the client negotiated them with CAPS) ---- */
++static void app_notify_out(uint32_t id,int kind,const char *title,const char *body,const char *tag,const char *hint,const char *url,int iw,int ih,const unsigned char *rgb){
++  (void)id; (void)kind; (void)title; (void)body; (void)tag; (void)hint; (void)url; (void)iw; (void)ih; (void)rgb; }
++static void app_notifyclose_out(uint32_t id){ (void)id; }
++static void app_unread_out(int count,int mentions,int flags){ (void)count; (void)mentions; (void)flags; }
+diff --git a/chrome/host.c b/chrome/host.c
+index 3e81fb8..43994d8 100644
+--- a/chrome/host.c
++++ b/chrome/host.c
+@@ -52,7 +52,7 @@ static void hist_note(void); static void display_url(const char *in,char *out,in
+ static int g_bidi; static char g_ctx[80]; /* Firefox backend (bidi.inc) */
+ static void bidi_from_cdp(const char *cmd); static int bidi_tree(void); static int bidi_tab_create(const char *url); static void bidi_tab_close(const char *ctx);
+ /* app mode (appmode.inc, ASB_APP): off for AmiSurf */
+-static int g_app; static void app_enable(void); static int app_cmd(char *c,char *arg); static int app_nav(const char *u);
++static int g_app, g_app_vis=1; static void app_client_hello(void); static void app_client_gone(void); static void app_enable(void); static int app_cmd(char *c,char *arg); static int app_nav(const char *u);
+ static int app_event(const char *method,const char *msg); static int app_hold(unsigned char *rgb,int iw,int ih);
+ static void app_tick(void); static void app_init(void); static void app_bws_read(void); static void app_bws_close(void);
+ static void app_close_chrome(void); static void app_logout(void);
+@@ -290,6 +290,7 @@ static void cdp_viewport(int w, int h){
+ }
+ static long long g_cast_due;
+ static void cdp_screencast(int on){
++  if(on && g_app && !g_app_vis){ if(g_screencast_on){ cdp("{\"id\":%d,\"method\":\"Page.stopScreencast\"}",cdp_id()); g_screencast_on=0; } return; }   /* app mode: client window hidden */
+   if(g_bidi){ g_screencast_on=on; if(on){ free(g_prev); g_prev=NULL; g_cast_due=0; } return; } /* frames are polled: bidi_cast_tick */
+   int i=cdp_id();
+   if(on){
+@@ -508,6 +509,7 @@ static void send_update(unsigned char *rgb,int iw,int ih,int n){
+ }
+ /* flow control: with ASBC_FF_ACK at most 2 updates are in flight; newer frames replace the waiting one (frame skip) */
+ static void frame_rgb(unsigned char *rgb,int iw,int ih,int n){
++  if(g_app && !g_app_vis){ free(rgb); return; }   /* app mode: the client's window is hidden (screenshots too) */
+   if((g_ff&ASBC_FF_ACK) && g_inflight>=2){ free(g_pend); g_pend=rgb; g_pend_w=iw; g_pend_h=ih; g_pend_cap=g_cap_ms; g_skipped++; return; }
+   send_update(rgb,iw,ih,n);
+ }
+@@ -689,6 +691,7 @@ static void bcon_tick(void){
+ #include "bidi.inc"
+ #include "audio.inc"
+ #include "appmode.inc"
++#include "appnotify.inc"
+ 
+ static int g_mx, g_my;
+ static int browser_switch(int want);
+@@ -698,7 +701,7 @@ static void on_client(int op, unsigned char *p, int n){
+   case ASBC_HELLO:
+     if(n>=5 && p[4] && p[4]!=(g_bidi?2:1) && !g_app){ g_vw=asbc_get_u16(p); g_vh=asbc_get_u16(p+2); browser_switch(p[4]); } /* BROWSER= from the client */
+     g_au_caps=n>=6?p[5]:0; if(g_au_caps) audio_start_cap(); else audio_stop_cap();
+-    if(n>=4){ cdp_viewport(asbc_get_u16(p), asbc_get_u16(p+2)); cdp_screencast(1); send_meta(); load_tabs(); send_tabs(); send_zoom(); kick_arm(); }
++    if(n>=4){ app_client_hello(); cdp_viewport(asbc_get_u16(p), asbc_get_u16(p+2)); cdp_screencast(1); send_meta(); load_tabs(); send_tabs(); send_zoom(); kick_arm(); }
+     break;
+   case ASBC_ACK: on_ack(); break;
+   case ASBC_AUDIOCTL: if(n>=1){ g_au_on=p[0]!=0; if(g_au_on) audio_start_cap(); else audio_stop_cap(); } break;
+@@ -847,6 +850,7 @@ static void close_cli(void){
+   if(g_cli>=0){ close(g_cli); g_cli=-1; }
+   audio_stop_cap();
+   if(g_screencast_on) cdp_screencast(0);
++  app_client_gone();
+ }
+ 
+ /* is an X server really listening on /tmp/.X11-unix/X<n>? (a stale socket file is not enough) */

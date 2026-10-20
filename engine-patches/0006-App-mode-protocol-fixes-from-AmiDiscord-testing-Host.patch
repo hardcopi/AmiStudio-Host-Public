@@ -1,0 +1,230 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: "Grok Bot (for Rich)" <hardcopi@users.noreply.github.com>
+Date: Sun, 18 Oct 2026 00:05:39 -0400
+Subject: [PATCH] App mode: protocol fixes from AmiDiscord testing (Host 0.1.5)
+
+- FILEPUT cancel: u32 req + u8 flags=2 (5 bytes) is enough; the full form stays valid.
+  A truncated non-cancel header ends the request with FILEDONE 2 instead of being dropped.
+- UNREAD: logged-out pages (ASB_APP_NOUNREAD, default /login /register /reset /verify and /)
+  report no unread state; Discord's login page favicon swap is not a badge. The plain
+  favicon is learned again on the first app page after login (also SPA pushState).
+- APPINFO: u32 max upload bytes appended after the caps (ASB_APP_MAXUPLOAD, 1..4095 MB).
+- OPENURL: url at most ASBC_OPENURL_MAX = 1023 bytes; longer ones are never cut, the
+  client gets a STATUS line instead.
+- App-mode downloads/uploads default to <ASB_STATE>/downloads|uploads (else <ASB_CONFIG>/...),
+  never AmiKit's Downloads drawer.
+---
+ chrome/appmode.inc   |  4 ++++
+ chrome/appnotify.inc | 29 ++++++++++++++++++++++++-----
+ chrome/appproto.inc  | 37 +++++++++++++++++++++++++++----------
+ chrome/asbc.h        | 10 +++++++---
+ chrome/host.c        |  2 ++
+ 5 files changed, 64 insertions(+), 18 deletions(-)
+
+diff --git a/chrome/appmode.inc b/chrome/appmode.inc
+index 6a4ff9f..e54e3d1 100644
+--- a/chrome/appmode.inc
++++ b/chrome/appmode.inc
+@@ -84,6 +84,10 @@ static void app_openurl(const char *url,int reason){
+   fprintf(stderr,"asb-chromed: app: external %s %.200s\n",reason==1?"window":reason==2?"address from the client":"link",url);
+   if(g_app_ext || g_cli<0) return;
+   if(!(g_app_caps&8)){ char s[700]; snprintf(s,sizeof s,"Opens outside the app: %.600s",url); send_status(s); return; }   /* ASBC_CAP_OPENURL */
++  size_t ul=strlen(url);
++  if(ul>ASBC_OPENURL_MAX){   /* a cut URL would open the wrong page: tell the user instead */
++    char s[300]; snprintf(s,sizeof s,"Link too long to open outside the app (%u bytes, limit %d): %.120s...",(unsigned)ul,ASBC_OPENURL_MAX,url);
++    fprintf(stderr,"asb-chromed: app: OPENURL not sent: %u bytes > %d\n",(unsigned)ul,ASBC_OPENURL_MAX); send_status(s); return; }
+   unsigned char b[2600]; int o=0; put_str16(b,&o,(int)sizeof b-1,url); b[o++]=(unsigned char)reason;
+   asbc_send(g_cli,ASBC_OPENURL,b,(uint32_t)o); }
+ 
+diff --git a/chrome/appnotify.inc b/chrome/appnotify.inc
+index 4fb16b8..b770118 100644
+--- a/chrome/appnotify.inc
++++ b/chrome/appnotify.inc
+@@ -7,7 +7,9 @@
+      reports to the "asbNotify" binding; notification permission is granted up front for the app's origins;
+    - the main frame's <title> and favicon <link> (the page's own metadata, watched by a MutationObserver on <head>):
+      Discord puts "(N) " (N = mentions + unread DMs) or a "• " (unread without mention) in front of its title, and
+-     swaps the favicon when it has unread mentions.
++     swaps the favicon when it has unread mentions. Logged-out pages (ASB_APP_NOUNREAD path prefixes, default
++     /login /register /reset /verify, and "/" itself) never report unread state: Discord's login page swaps its
++     favicon too, which is not a badge. The plain favicon is learned again on the first app page after them.
+    Binding: random name per run, added again on every Page.frameNavigated (no Runtime.enable); the shim takes it off
+    window at once and prefixes every message with the per-run key, so other frames cannot fake notifications.
+    The shim reports JSON arrays (after the key): ["hello",top,origin], ["show",id,title,body,tag,url,icon], ["close",id],
+@@ -104,6 +106,8 @@ static int g_app_foc=1;                 /* g_app_vis (host.c) is the visible fla
+ static int g_app_unread[3], g_app_unread_sent[3]={-1,-1,-1};   /* count, mentions, flags (1 dot, 2 favicon badge) */
+ static long long g_app_unread_t;
+ static char g_app_icon0[600], g_app_iconcur[600];   /* first favicon of the document (the plain one), current one */
++static char g_app_titlecur[300];                     /* the page's latest title (for the unread state) */
++static char g_app_nounread[16][64]; static int g_app_nnounread=-1;   /* logged-out path prefixes (ASB_APP_NOUNREAD) */
+ static int g_app_nlogged;
+ 
+ #define APP_NTF 32
+@@ -194,13 +198,28 @@ static void app_title_unread(const char *t,int *count,int *dot){
+         if(sscanf(t,fmt,&v,&used)==1 && used>0 && t[used-1]==pf[strlen(pf)-1]){ *count=(int)(v>65535?65535:v); t+=used; again=1; break; } }
+       else { size_t l=strlen(pf); if(!strncmp(t,pf,l)){ *dot=1; t+=l; again=1; break; } } } } }
+ 
+-static void app_unread_update(const char *title){
+-  int c,d; app_title_unread(title,&c,&d);
++/* 1 if the main frame shows a logged-out page (login, register, ...): its path is "/" or starts with one of the
++   ASB_APP_NOUNREAD prefixes (comma/space list; a prefix matches whole path segments: /login, /login/x, not /logins) */
++static int app_logged_out_page(void){
++  if(g_app_nnounread<0){ const char *e=getenv("ASB_APP_NOUNREAD"); char l[1024]; scopy(l,sizeof l,e?e:"/login,/register,/reset,/verify");
++    g_app_nnounread=0; for(char *t=strtok(l,", \t");t && g_app_nnounread<16;t=strtok(NULL,", \t")) if(t[0]=='/') scopy(g_app_nounread[g_app_nnounread++],64,t); }
++  const char *u=strstr(g_url,"://"); if(!u) return 0;   /* about:blank, data: ... */
++  const char *pth=strchr(u+3,'/'); if(!pth) return 1;   /* "https://discord.com" = the logged-out home page */
++  size_t pl=strcspn(pth,"?#"); if(pl==1) return 1;      /* "/" */
++  for(int i=0;i<g_app_nnounread;i++){ size_t l=strlen(g_app_nounread[i]); while(l>1 && g_app_nounread[i][l-1]=='/') l--;
++    if(pl>=l && !strncmp(pth,g_app_nounread[i],l) && (pl==l || pth[l]=='/')) return 1; }
++  return 0; }
++static void app_unread_recalc(void){
++  if(app_logged_out_page()){ g_app_icon0[0]=0; g_app_unread[0]=g_app_unread[1]=g_app_unread[2]=0; return; }
++  if(!g_app_icon0[0] && g_app_iconcur[0]) scopy(g_app_icon0,sizeof g_app_icon0,g_app_iconcur);   /* first app page after login */
++  int c,d; app_title_unread(g_app_titlecur,&c,&d);
+   int badge=g_app_icon0[0] && g_app_iconcur[0] && strcmp(g_app_icon0,g_app_iconcur);
+   g_app_unread[0]=c; g_app_unread[1]=c; g_app_unread[2]=(d?1:0)|(badge?2:0); }
++static void app_unread_update(const char *title){ scopy(g_app_titlecur,sizeof g_app_titlecur,title); app_unread_recalc(); }
+ 
+ /* sends a changed unread state at most twice a second (main loop), and the latest one on reconnect */
+ static void app_unread_tick(void){
++  app_unread_recalc();   /* the URL can change without a title/favicon change (SPA navigation to or from /login) */
+   if(!memcmp(g_app_unread,g_app_unread_sent,sizeof g_app_unread) || now_ms()-g_app_unread_t<500) return;
+   memcpy(g_app_unread_sent,g_app_unread,sizeof g_app_unread); g_app_unread_t=now_ms();
+   fprintf(stderr,"asb-chromed: app: unread %d mentions %d flags %d\n",g_app_unread[0],g_app_unread[1],g_app_unread[2]);
+@@ -224,10 +243,10 @@ static void app_shim_msg(const char *pl){
+   while(*p && *p!=']' && n<9){ p=ja_next(p,a[n],(int)sizeof a[0]); n++; while(*p==' ') p++; if(*p!=',' && *p!=']') break; }
+   if(n<2 || strcmp(a[0],g_app_key)) return;   /* not from our shim (the binding is visible to the page briefly) */
+   memmove(a[0],a[1],sizeof a[0]*(size_t)(n-1)); n--;   /* drop the token */
+-  if(!strcmp(a[0],"hello")){ char s[40]; if(n>=2 && atoi(a[1])){ g_app_icon0[0]=0;   /* new top document: next favicon is the plain one */
++  if(!strcmp(a[0],"hello")){ char s[40]; if(n>=2 && atoi(a[1])){ g_app_icon0[0]=0; g_app_iconcur[0]=0;   /* new top document: next favicon is the plain one */
+       static char lasto[200]; if(n>=3 && strcmp(lasto,a[2])){ scopy(lasto,sizeof lasto,a[2]); fprintf(stderr,"asb-chromed: app: notification shim active on %.150s\n",a[2]); } } snprintf(s,sizeof s,"[\"focus\",%d,%d]",g_app_foc,g_app_vis); app_to_shim(s); return; }
+   if(!strcmp(a[0],"meta") && n>=3){
+-    scopy(g_app_iconcur,sizeof g_app_iconcur,a[2]); if(!g_app_icon0[0]) scopy(g_app_icon0,sizeof g_app_icon0,a[2]);
++    scopy(g_app_iconcur,sizeof g_app_iconcur,a[2]); if(!g_app_icon0[0] && !app_logged_out_page()) scopy(g_app_icon0,sizeof g_app_icon0,a[2]);
+     if(strcmp(g_title,a[1]) && a[1][0]){ scopy(g_title,sizeof g_title,a[1]); send_meta(); }
+     app_unread_update(a[1]); return; }
+   if(!strcmp(a[0],"clip") && n>=2){ if(g_cli>=0 && a[1][0]) asbc_send(g_cli,ASBC_CLIP,a[1],(uint32_t)strlen(a[1])); return; }
+diff --git a/chrome/appproto.inc b/chrome/appproto.inc
+index 92d2d02..da08acf 100644
+--- a/chrome/appproto.inc
++++ b/chrome/appproto.inc
+@@ -3,9 +3,12 @@
+    Op numbers and payloads: asbc.h. A message type goes to the client only if the client set its bit with ASBC_CAPS
+    (sent after FMT); the Host answers CAPS with APPINFO. AmiSurf never sends CAPS: nothing changes for it, and
+    asb-chromed outside app mode ignores the new client ops.
+-   Environment: ASB_APP_MAXUPLOAD  upload limit in MB (default 25)
+-                ASB_UPLOADS        where uploads are kept for the page (default <ASB_CONFIG>/uploads; engine.sh:
+-                                   <ASB_STATE>/uploads); files are deleted 10 minutes after they were handed over */
++   Environment: ASB_APP_MAXUPLOAD  upload limit in MB per FILEREQ (default 25, 1..4095); APPINFO tells the client
++                ASB_UPLOADS        where uploads are kept for the page (default <ASB_STATE>/uploads, or
++                                   <ASB_CONFIG>/uploads without ASB_STATE); files are deleted 10 minutes after they
++                                   were handed over
++                ASB_DOWNLOADS      where the page's downloads go (app mode default <ASB_STATE>/downloads, or
++                                   <ASB_CONFIG>/downloads without ASB_STATE; host.c) */
+ 
+ #define APP_HOSTCAPS (ASBC_CAP_NOTIFY|ASBC_CAP_UNREAD|ASBC_CAP_FOCUS|ASBC_CAP_OPENURL|ASBC_CAP_FILE|ASBC_CAP_DOWNLOAD)
+ static uint32_t g_app_caps;   /* what this client negotiated (0 until CAPS) */
+@@ -70,7 +73,8 @@ static struct { uint32_t req; int open, multiple, backend, desc_id, nf; char acc
+ static uint32_t g_up_seq;
+ static struct { char path[800]; long long t; } g_upkeep[32]; static int g_nupkeep;
+ static char g_updir[700];
+-static long long app_maxupload(void){ return (long long)env_int("ASB_APP_MAXUPLOAD",25)*1024*1024; }
++static long long app_maxupload(void){ int mb=env_int("ASB_APP_MAXUPLOAD",25); if(mb<1) mb=25; if(mb>4095) mb=4095;   /* fits APPINFO's u32 */
++  return (long long)mb*1024*1024; }
+ static void app_filedone(uint32_t req,int status,const char *msg){
+   fprintf(stderr,"asb-chromed: app: upload %u: %s\n",req,msg);
+   if(!app_can(ASBC_CAP_FILE)) return;
+@@ -104,14 +108,21 @@ static int app_file_event(const char *method,const char *msg){
+         if(!(k&1) && !strcmp(v,"accept")){ ja_next(a,g_up.accept,(int)sizeof g_up.accept); break; } } }
+     app_filereq_send(); return 1; }
+   return 0; }
++/* FILEPUT: u32 req, u8 flags, then (not needed for a cancel) str name, u32 size, data.
++   A cancel (flags & 2) may be just the 5 bytes u32 req + u8 flags; anything after them is ignored, so the full
++   11+ byte form stays valid. */
+ static void app_fileput(const unsigned char *p,int n){
+-  if(n<11) return;
+-  uint32_t req=get_u32(p); int flags=p[4]; unsigned nl=asbc_get_u16(p+5);
+-  if(n<7+(int)nl+4) return;
++  if(n<5) return;
++  uint32_t req=get_u32(p); int flags=p[4];
++  if(flags&2){
++    if(!g_up.open || req!=g_up.req){ app_filedone(req,2,"no such file request"); return; }
++    up_abort(); app_filedone(req,2,"cancelled"); return; }
++  unsigned nl=n>=7?asbc_get_u16(p+5):0;
++  if(n<11 || n<7+(int)nl+4){   /* truncated header: end the request instead of leaving the client waiting */
++    if(g_up.open && req==g_up.req){ up_abort(); app_filedone(req,2,"bad FILEPUT (header too short)"); } return; }
+   char name[256]; int k=(int)nl<255?(int)nl:255; memcpy(name,p+7,(size_t)k); name[k]=0;
+   uint32_t size=get_u32(p+7+nl); const unsigned char *d=p+11+nl; int dn=n-11-(int)nl;
+   if(!g_up.open || req!=g_up.req){ app_filedone(req,2,"no such file request"); return; }
+-  if(flags&2){ up_abort(); app_filedone(req,2,"cancelled"); return; }
+   if(nl){   /* a new file */
+     if(g_up.f){ fclose(g_up.f); g_up.f=NULL; }
+     if(g_up.nf==8 || (g_up.nf && !g_up.multiple)){ up_abort(); app_filedone(req,2,"too many files"); return; }
+@@ -142,8 +153,11 @@ static void app_upload_tick(void){
+   while(g_nupkeep && t-g_upkeep[0].t>600000){ up_unlink(g_upkeep[0].path); memmove(g_upkeep,g_upkeep+1,sizeof g_upkeep[0]*(size_t)(g_nupkeep-1)); g_nupkeep--; } }
+ 
+ /* ---- client ops ---- */
++/* APPINFO: str app id, str start URL, u32 host caps, then (Host 0.1.5+, appended so older clients that stop after
++   the caps still parse it) u32 max upload in bytes per FILEREQ (ASB_APP_MAXUPLOAD). Clients ignore further bytes. */
+ static void app_send_appinfo(void){
+   unsigned char b[1400]; int o=0; put_s16(b,&o,(int)sizeof b,g_app_id,60); put_s16(b,&o,(int)sizeof b,g_app_url,1200); put_u32(b,&o,APP_HOSTCAPS);
++  put_u32(b,&o,(uint32_t)app_maxupload());
+   asbc_send(g_cli,ASBC_APPINFO,b,(uint32_t)o); }
+ /* returns 1 if the op was an app-mode op (ignored outside app mode, as before) */
+ static int app_client_op(int op,const unsigned char *p,int n){
+@@ -163,6 +177,9 @@ static int app_client_op(int op,const unsigned char *p,int n){
+   return 1; }
+ static void app_proto_init(void){
+   if(!g_app) return;
+-  const char *u=getenv("ASB_UPLOADS"); if(u&&u[0]) scopy(g_updir,sizeof g_updir,u); else snprintf(g_updir,sizeof g_updir,"%s/uploads",g_cfg);
+-  mkdir(g_updir,0700); }
++  const char *u=getenv("ASB_UPLOADS"), *st=getenv("ASB_STATE");
++  if(u&&u[0]) scopy(g_updir,sizeof g_updir,u);
++  else snprintf(g_updir,sizeof g_updir,"%.600s/uploads",st&&st[0]?st:g_cfg);
++  mkdir(g_updir,0700);
++  fprintf(stderr,"asb-chromed: app: uploads %s, limit %lld MB\n",g_updir,app_maxupload()/1048576); }
+ static void app_proto_gone(void){ g_app_caps=0; if(g_up.open){ up_abort(); } g_up.desc_id=0; }
+diff --git a/chrome/asbc.h b/chrome/asbc.h
+index 91128c9..6e4ddad 100644
+--- a/chrome/asbc.h
++++ b/chrome/asbc.h
+@@ -61,18 +61,22 @@ enum {
+   ASBC_FOCUS    = 23, /* c->h u8 focused, u8 visible (0/1): the client window's state (CAP_FOCUS) */
+   ASBC_NOTIFYACT= 24, /* c->h u32 id, u8 action (0 clicked/opened, 1 dismissed by the user) (CAP_NOTIFY) */
+   ASBC_FILEPUT  = 25, /* c->h u32 req, u8 flags (1 last chunk of the request, 2 cancel), str name, u32 size, data
+-                         (<= 64 KB per chunk). A chunk with a name starts a file; later chunks of it: name "" (CAP_FILE) */
++                         (<= 64 KB per chunk). A chunk with a name starts a file; later chunks of it: name "" (CAP_FILE).
++                         A cancel may be only u32 req + u8 flags=2 (5 bytes); the full form is accepted too */
+   ASBC_NOTIFY   = 45, /* h->c u32 id, u8 kind (0 message, 1 mention, 2 DM, 3 call, 255 other), str title, str body,
+                          str tag, str hint ("#channel, Server"), str url, u8 has_icon [u16 w, u16 h, w*h RGB24, <= 64x64] */
+   ASBC_NOTIFYCLOSE=46,/* h->c u32 id: the page closed it */
+   ASBC_UNREAD   = 47, /* h->c u16 count, u16 mentions, u8 flags (1 unread without mention, 2 favicon badge) */
+   ASBC_OPENURL  = 48, /* h->c str url, u8 reason (0 link, 1 new window, 2 client NAV not allowed): open it outside the
+-                         app (CAP_OPENURL; without it the URL goes out as STATUS) */
++                         app (CAP_OPENURL; without it the URL goes out as STATUS). url <= ASBC_OPENURL_MAX bytes; a
++                         longer one is never cut: the client gets a STATUS line instead */
+   ASBC_FILEREQ  = 49, /* h->c u32 req, u8 flags (1 multiple), str accept: the page opened a file chooser */
+   ASBC_FILEDONE = 50, /* h->c u32 req, u8 status (0 ok, 1 too big, 2 error/cancelled), str message */
+   ASBC_DOWNLOAD = 51, /* h->c u8 state (0 started, 1 done, 2 failed), str name, u32 size, str host path */
+-  ASBC_APPINFO  = 52  /* h->c str app id, str start URL, u32 ASBC_CAP_* the Host supports (reply to CAPS) */
++  ASBC_APPINFO  = 52  /* h->c str app id, str start URL, u32 ASBC_CAP_* the Host supports (reply to CAPS), then
++                         u32 max upload bytes per FILEREQ (Host 0.1.5+; absent from older Hosts). Ignore extra bytes */
+ };
++#define ASBC_OPENURL_MAX 1023   /* bytes of OPENURL's url: fits a 1024-byte client buffer with its NUL */
+ enum { ASBC_CAP_NOTIFY=1, ASBC_CAP_UNREAD=2, ASBC_CAP_FOCUS=4, ASBC_CAP_OPENURL=8, ASBC_CAP_FILE=16,
+        ASBC_CAP_DOWNLOAD=32, ASBC_CAP_PASTEIMG=64 };
+ 
+diff --git a/chrome/host.c b/chrome/host.c
+index 042f6fc..4537358 100644
+--- a/chrome/host.c
++++ b/chrome/host.c
+@@ -1057,7 +1057,9 @@ int main(int argc, char **argv){
+     if(!profile_set) snprintf(profile,sizeof profile,"%s/.config/amistudio-chrome-%s",home,g_app_id); }   /* never AmiSurf's profile */
+   feat_init(asbc); app_proto_init();
+   const char *dlenv=getenv("ASB_DOWNLOADS");
++  const char *stenv=getenv("ASB_STATE");
+   if(dlenv&&dlenv[0]) snprintf(g_dlpath,sizeof g_dlpath,"%s",dlenv);
++  else if(g_app) snprintf(g_dlpath,sizeof g_dlpath,"%.500s/downloads",stenv&&stenv[0]?stenv:g_cfg);   /* app mode: the app's own folder */
+   else if(access("/opt/amikit/AmiKit",F_OK)==0)
+     snprintf(g_dlpath,sizeof g_dlpath,"/opt/amikit/AmiKit/Downloads");
+   else snprintf(g_dlpath,sizeof g_dlpath,"%s/amikit/AmiKit/Downloads",home);

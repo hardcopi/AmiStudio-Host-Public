@@ -1,0 +1,419 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: "Grok Bot (for Rich)" <hardcopi@users.noreply.github.com>
+Date: Sat, 17 Oct 2026 23:21:09 -0400
+Subject: [PATCH] App mode: capability-gated client protocol (CAPS/APPINFO,
+ NOTIFY, UNREAD, FOCUS, files, downloads)
+
+New ASBC ops (asbc.h, appproto.inc), app mode only:
+client->host CAPS 22, FOCUS 23, NOTIFYACT 24, FILEPUT 25;
+host->client NOTIFY 45, NOTIFYCLOSE 46, UNREAD 47, OPENURL 48 (now gated),
+FILEREQ 49, FILEDONE 50, DOWNLOAD 51, APPINFO 52.
+
+A message type is sent only if the client set its ASBC_CAP_* bit with
+CAPS; CAPS is answered with APPINFO and the latest UNREAD. Without CAPS an
+external URL is shown as STATUS. Outside app mode ops 22-25 are ignored as
+before, so AmiSurf is unchanged.
+
+Uploads: Page.setInterceptFileChooserDialog (only with CAP_FILE), FILEREQ
+with the input's accept, FILEPUT chunks into ASB_UPLOADS/<req>-<n>/NAME,
+DOM.setFileInputFiles, ASB_APP_MAXUPLOAD (25 MB), files removed after 10
+minutes. Downloads: allowAndName, renamed to a free NAME on completion so
+DOWNLOAD reports the exact path. navigator.clipboard.writeText -> CLIP.
+The client message buffer grows to 64 KB + 4 KB for FILEPUT chunks.
+---
+ Makefile             |   4 +-
+ chrome/appmode.inc   |   9 ++-
+ chrome/appnotify.inc |  12 ++--
+ chrome/appproto.inc  | 168 +++++++++++++++++++++++++++++++++++++++++++
+ chrome/asbc.h        |  22 +++++-
+ chrome/features.inc  |   6 +-
+ chrome/host.c        |   8 ++-
+ 7 files changed, 209 insertions(+), 20 deletions(-)
+ create mode 100644 chrome/appproto.inc
+
+diff --git a/Makefile b/Makefile
+index 45088e0..c47b355 100644
+--- a/Makefile
++++ b/Makefile
+@@ -23,7 +23,7 @@ amiga: $(AMIGA_BINS)
+ chrome-host: build/host/asb-chromed
+ sdl: build/host/asb-sdl
+ 
+-build/host/asb-chromed: chrome/host.c chrome/features.inc chrome/frames.inc chrome/bidi.inc chrome/audio.inc chrome/appmode.inc chrome/appnotify.inc $(PROTO)
++build/host/asb-chromed: chrome/host.c chrome/features.inc chrome/frames.inc chrome/bidi.inc chrome/audio.inc chrome/appmode.inc chrome/appnotify.inc chrome/appproto.inc $(PROTO)
+ 	@mkdir -p $(@D); $(HOSTCC) $(HOSTCFLAGS) -o $@ chrome/host.c chrome/asbc.c -lcrypto -lm
+ build/host/asb-sdl: ui/asb_sdl_chrome.c $(PROTO)
+ 	@mkdir -p $(@D); $(HOSTCC) $(HOSTCFLAGS) -I/usr/include/SDL2 -o $@ ui/asb_sdl_chrome.c chrome/asbc.c -lSDL2 -lSDL2_ttf -lm
+@@ -66,7 +66,7 @@ clean:
+ .PHONY: all host amiga chrome-host sdl test lha clean
+ 
+ # static asb-chromed (AmiKit bundle; also a portable engine for the AmiStudio Host's "browser" service)
+-build/static/asb-chromed: chrome/host.c chrome/features.inc chrome/frames.inc chrome/bidi.inc chrome/audio.inc chrome/appmode.inc chrome/appnotify.inc $(PROTO)
++build/static/asb-chromed: chrome/host.c chrome/features.inc chrome/frames.inc chrome/bidi.inc chrome/audio.inc chrome/appmode.inc chrome/appnotify.inc chrome/appproto.inc $(PROTO)
+ 	@mkdir -p $(@D); $(HOSTCC) -O2 -std=gnu99 -pthread -static -o $@ chrome/host.c chrome/asbc.c -lcrypto -lz -lzstd -lm 2>&1 | grep -v "warning: Using" || true; test -x $@
+ # 0.82: the own Linux host package (asb-chromed-<ver>-linux-x86_64.tar.gz, dist/host/) is retired; the AmiStudio Host
+ # runs asb-chromed (docs/HOST.md). The last one is asb-chromed-0.77-linux-x86_64.tar.gz.
+diff --git a/chrome/appmode.inc b/chrome/appmode.inc
+index 37d5045..6a4ff9f 100644
+--- a/chrome/appmode.inc
++++ b/chrome/appmode.inc
+@@ -30,6 +30,8 @@ static int g_rm=1, g_rm_small_ms=100, g_rm_big_ms=1000, g_app_dark, g_app_mute=1
+ static int g_app_fetch_on;                /* Fetch.enable done on this tab */
+ static void app_bws_open(void);
+ static int app_notify_event(const char *method,const char *msg); static void app_shim_install(void); static void app_grant(void);
++static uint32_t g_app_caps; static void app_dl_behavior(void); static void app_intercept_files(int on);
++static int app_file_event(const char *method,const char *msg); static void app_upload_tick(void); static void app_proto_gone(void);
+ static void app_focus(int f,int v); static void app_notify_act(uint32_t id,int action); static void app_unread_tick(void);
+ 
+ static const char *APP_DEFAULT_ALLOW="discord.com,*.discord.com,discordapp.com,*.discordapp.com,*.discordapp.net,"
+@@ -81,6 +83,7 @@ static void put_str16(unsigned char *b,int *o,int cap,const char *s){
+ static void app_openurl(const char *url,int reason){
+   fprintf(stderr,"asb-chromed: app: external %s %.200s\n",reason==1?"window":reason==2?"address from the client":"link",url);
+   if(g_app_ext || g_cli<0) return;
++  if(!(g_app_caps&8)){ char s[700]; snprintf(s,sizeof s,"Opens outside the app: %.600s",url); send_status(s); return; }   /* ASBC_CAP_OPENURL */
+   unsigned char b[2600]; int o=0; put_str16(b,&o,(int)sizeof b-1,url); b[o++]=(unsigned char)reason;
+   asbc_send(g_cli,ASBC_OPENURL,b,(uint32_t)o); }
+ 
+@@ -95,7 +98,7 @@ static void app_enable(void){
+   /* top-level documents are checked before they load (Fetch, request stage, documents only) */
+   int i=cdp_id(); cdp("{\"id\":%d,\"method\":\"Fetch.enable\",\"params\":{\"patterns\":[{\"urlPattern\":\"*\",\"resourceType\":\"Document\",\"requestStage\":\"Request\"}]}}",i);
+   g_app_fetch_on=1;
+-  app_shim_install();
++  app_shim_install(); app_dl_behavior(); if(g_app_caps&16) app_intercept_files(1);
+   app_bws_open(); }
+ 
+ /* ---- new windows: window.open / target=_blank ----
+@@ -206,7 +209,7 @@ static int app_nav(const char *u){
+ /* CDP events/replies for app mode; returns 1 if consumed */
+ static int app_event(const char *method,const char *msg){
+   if(!g_app) return 0;
+-  if(app_notify_event(method,msg)) return 1;
++  if(app_notify_event(method,msg) || app_file_event(method,msg)) return 1;
+   if(!strcmp(method,"Fetch.requestPaused")){
+     char rid[120]="", fid[80]="", url[2400]=""; json_str(msg,"requestId",rid,sizeof rid); json_str(msg,"frameId",fid,sizeof fid);
+     { const char *r=strstr(msg,"\"request\""); json_str(r?r:msg,"url",url,sizeof url); }
+@@ -250,7 +253,7 @@ static void app_logout(void){
+ /* every main-loop pass (20 ms) */
+ static void app_tick(void){
+   if(!g_app) return;
+-  app_hold_flush(); app_unread_tick();
++  app_hold_flush(); app_unread_tick(); app_upload_tick();
+   long long t=now_ms();
+   for(int k=0;k<g_npop;k++) if(t-g_pop[k].t>8000){ fprintf(stderr,"asb-chromed: app: empty new window closed\n");
+     bcdp("{\"id\":%d,\"method\":\"Target.closeTarget\",\"params\":{\"targetId\":\"%s\"}}",cdp_id(),g_pop[k].tid); pop_drop(k); k--; }
+diff --git a/chrome/appnotify.inc b/chrome/appnotify.inc
+index b8f2746..4fb16b8 100644
+--- a/chrome/appnotify.inc
++++ b/chrome/appnotify.inc
+@@ -11,7 +11,7 @@
+    Binding: random name per run, added again on every Page.frameNavigated (no Runtime.enable); the shim takes it off
+    window at once and prefixes every message with the per-run key, so other frames cannot fake notifications.
+    The shim reports JSON arrays (after the key): ["hello",top,origin], ["show",id,title,body,tag,url,icon], ["close",id],
+-   ["meta",title,favicon href]; icon = "WxH:" + base64 RGB24 (<= 64x64, on white) or "".
++   ["meta",title,favicon href], ["clip",text] (navigator.clipboard.writeText -> ASBC_CLIP); icon = "WxH:" + base64 RGB24 (<= 64x64, on white) or "".
+    The Host talks back with a CustomEvent whose name is a random per-run key: ["focus",f,v], ["click",id],
+    ["dismiss",id].
+ 
+@@ -62,6 +62,7 @@ static const char APP_SHIM[] =
+   "  static get maxActions(){ return 0; }\n"
+   "}\n"
+   "window.Notification=Notification;\n"
++  "try{ var CP=window.Clipboard&&Clipboard.prototype, wt=CP&&CP.writeText; if(wt) CP.writeText=function writeText(t){ post([\"clip\",String(t)]); return wt.call(this,t).catch(function(){}); }; }catch(e){}\n"
+   "if(window.ServiceWorkerRegistration){ var P=ServiceWorkerRegistration.prototype;\n"
+   "  P.showNotification=function(t,o){ new Notification(t,o); return Promise.resolve(); };\n"
+   "  P.getNotifications=function(){ return Promise.resolve(Object.keys(live).map(function(k){ return live[k]; })); }; }\n"
+@@ -229,6 +230,7 @@ static void app_shim_msg(const char *pl){
+     scopy(g_app_iconcur,sizeof g_app_iconcur,a[2]); if(!g_app_icon0[0]) scopy(g_app_icon0,sizeof g_app_icon0,a[2]);
+     if(strcmp(g_title,a[1]) && a[1][0]){ scopy(g_title,sizeof g_title,a[1]); send_meta(); }
+     app_unread_update(a[1]); return; }
++  if(!strcmp(a[0],"clip") && n>=2){ if(g_cli>=0 && a[1][0]) asbc_send(g_cli,ASBC_CLIP,a[1],(uint32_t)strlen(a[1])); return; }
+   if(!strcmp(a[0],"close") && n>=2){ int i=ntf_find_shim(atoll(a[1])); if(i<0) return;
+     uint32_t id=g_ntf[i].id; ntf_drop(i);
+     fprintf(stderr,"asb-chromed: app: notification %u closed by the page\n",id); app_notifyclose_out(id); return; }
+@@ -267,10 +269,6 @@ static void app_client_hello(void){   /* before HELLO starts the screencast */
+   if(!g_app) return; g_app_foc=1; g_app_vis=1;
+   cdp("{\"id\":%d,\"method\":\"Emulation.setFocusEmulationEnabled\",\"params\":{\"enabled\":true}}",cdp_id());
+   app_to_shim("[\"focus\",1,1]"); memset(g_app_unread_sent,0xff,sizeof g_app_unread_sent); g_app_unread_t=0; }
+-static void app_client_gone(void){ if(!g_app) return; app_focus(0,0); }
++static void app_client_gone(void){ if(!g_app) return; app_proto_gone(); app_focus(0,0); }
+ 
+-/* ---- to the client (M4 sends these as ASBC messages when the client negotiated them with CAPS) ---- */
+-static void app_notify_out(uint32_t id,int kind,const char *title,const char *body,const char *tag,const char *hint,const char *url,int iw,int ih,const unsigned char *rgb){
+-  (void)id; (void)kind; (void)title; (void)body; (void)tag; (void)hint; (void)url; (void)iw; (void)ih; (void)rgb; }
+-static void app_notifyclose_out(uint32_t id){ (void)id; }
+-static void app_unread_out(int count,int mentions,int flags){ (void)count; (void)mentions; (void)flags; }
++#include "appproto.inc"
+diff --git a/chrome/appproto.inc b/chrome/appproto.inc
+new file mode 100644
+index 0000000..92d2d02
+--- /dev/null
++++ b/chrome/appproto.inc
+@@ -0,0 +1,168 @@
++/* appproto.inc - app mode (ASB_APP) client protocol: CAPS/APPINFO, FOCUS, NOTIFY/NOTIFYCLOSE/NOTIFYACT, UNREAD,
++   OPENURL gating, FILEREQ/FILEPUT/FILEDONE (uploads) and DOWNLOAD. Included from appnotify.inc.
++   Op numbers and payloads: asbc.h. A message type goes to the client only if the client set its bit with ASBC_CAPS
++   (sent after FMT); the Host answers CAPS with APPINFO. AmiSurf never sends CAPS: nothing changes for it, and
++   asb-chromed outside app mode ignores the new client ops.
++   Environment: ASB_APP_MAXUPLOAD  upload limit in MB (default 25)
++                ASB_UPLOADS        where uploads are kept for the page (default <ASB_CONFIG>/uploads; engine.sh:
++                                   <ASB_STATE>/uploads); files are deleted 10 minutes after they were handed over */
++
++#define APP_HOSTCAPS (ASBC_CAP_NOTIFY|ASBC_CAP_UNREAD|ASBC_CAP_FOCUS|ASBC_CAP_OPENURL|ASBC_CAP_FILE|ASBC_CAP_DOWNLOAD)
++static uint32_t g_app_caps;   /* what this client negotiated (0 until CAPS) */
++
++static void put_u32(unsigned char *b,int *o,uint32_t v){ b[*o]=(unsigned char)v; b[*o+1]=(unsigned char)(v>>8); b[*o+2]=(unsigned char)(v>>16); b[*o+3]=(unsigned char)(v>>24); *o+=4; }
++static uint32_t get_u32(const unsigned char *p){ return (uint32_t)p[0]|((uint32_t)p[1]<<8)|((uint32_t)p[2]<<16)|((uint32_t)p[3]<<24); }
++static int app_can(uint32_t cap){ return g_app && g_cli>=0 && (g_app_caps&cap); }
++/* str with a byte limit that does not cut a UTF-8 sequence */
++static void put_s16(unsigned char *b,int *o,int cap,const char *s,int lim){
++  int n=(int)strlen(s); if(n>lim){ n=lim; while(n>0 && ((unsigned char)s[n]&0xC0)==0x80) n--; }
++  if(n>cap-*o-2) n=cap-*o-2; if(n<0) n=0;
++  asbc_put_u16(b+*o,(unsigned)n); *o+=2; memcpy(b+*o,s,(size_t)n); *o+=n; }
++
++/* ---- outputs used by appnotify.inc / appmode.inc ---- */
++static void app_notify_out(uint32_t id,int kind,const char *title,const char *body,const char *tag,const char *hint,const char *url,int iw,int ih,const unsigned char *rgb){
++  if(!app_can(ASBC_CAP_NOTIFY)) return;
++  static unsigned char b[8192+64*64*3]; int o=0, cap=(int)sizeof b-64*64*3-8;
++  put_u32(b,&o,id); b[o++]=(unsigned char)kind;
++  put_s16(b,&o,cap,title,300); put_s16(b,&o,cap,body,2000); put_s16(b,&o,cap,tag,200); put_s16(b,&o,cap,hint,200); put_s16(b,&o,cap,url,1200);
++  if(iw>0 && ih>0){ b[o++]=1; asbc_put_u16(b+o,(unsigned)iw); asbc_put_u16(b+o+2,(unsigned)ih); o+=4; memcpy(b+o,rgb,(size_t)iw*ih*3); o+=iw*ih*3; }
++  else b[o++]=0;
++  asbc_send(g_cli,ASBC_NOTIFY,b,(uint32_t)o); }
++static void app_notifyclose_out(uint32_t id){
++  if(!app_can(ASBC_CAP_NOTIFY)) return;
++  unsigned char b[4]; int o=0; put_u32(b,&o,id); asbc_send(g_cli,ASBC_NOTIFYCLOSE,b,4); }
++static void app_unread_out(int count,int mentions,int flags){
++  if(!app_can(ASBC_CAP_UNREAD)) return;
++  unsigned char b[5]; asbc_put_u16(b,(unsigned)count); asbc_put_u16(b+2,(unsigned)mentions); b[4]=(unsigned char)flags;
++  asbc_send(g_cli,ASBC_UNREAD,b,5); }
++
++/* ---- downloads: kept in ASB_DOWNLOADS under their own name; DOWNLOAD tells the client where ---- */
++static void app_dl_behavior(void){   /* Chrome saves as <guid>; renamed on completion, so the reported path is exact */
++  if(!g_app || g_bidi) return;
++  char e[1100]; jsonesc(g_dlpath[0]?g_dlpath:"/tmp",e,sizeof e);
++  cdp("{\"id\":%d,\"method\":\"Browser.setDownloadBehavior\",\"params\":{\"behavior\":\"allowAndName\",\"downloadPath\":\"%s\",\"eventsEnabled\":true}}",cdp_id(),e); }
++static void app_safe_name(const char *in,char *out,int cap){
++  int n=0; for(;*in && n<cap-1;in++){ unsigned char c=(unsigned char)*in;
++    out[n++]=(c<32||c=='/'||c=='\\'||c==':'||c=='"'||c=='*'||c=='?'||c=='<'||c=='>'||c=='|')?'_':(char)c; }
++  out[n]=0; while(n>0 && (out[n-1]==' '||out[n-1]=='.')) out[--n]=0;
++  if(!out[0] || !strcmp(out,".") || !strcmp(out,"..")) scopy(out,cap,"download"); }
++static void app_download(const char *guid,const char *name,int state,double size){
++  if(!g_app) return;
++  char path[1400]=""; char nm[256]; app_safe_name(name,nm,sizeof nm);
++  if(state==1 && guid[0]){
++    const char *dir=g_dlpath[0]?g_dlpath:"/tmp"; char from[1000]; snprintf(from,sizeof from,"%s/%s",dir,guid);
++    char base[256], ext[64]=""; scopy(base,sizeof base,nm); char *dot=strrchr(base,'.'); if(dot && dot!=base && strlen(dot)<sizeof ext){ scopy(ext,sizeof ext,dot); *dot=0; }
++    struct stat st;
++    for(int k=0;k<1000;k++){
++      if(k) snprintf(path,sizeof path,"%s/%s (%d)%s",dir,base,k,ext); else snprintf(path,sizeof path,"%s/%s%s",dir,base,ext);
++      if(stat(path,&st)) break; }
++    if(rename(from,path)){ fprintf(stderr,"asb-chromed: app: download %s: rename failed: %s\n",nm,strerror(errno)); scopy(path,sizeof path,from); }
++    { const char *sl=strrchr(path,'/'); scopy(nm,sizeof nm,sl?sl+1:path); } }
++  fprintf(stderr,"asb-chromed: app: download %s %s%s%s\n",state==0?"started":state==1?"done":"failed",nm,path[0]?" -> ":"",path);
++  if(!app_can(ASBC_CAP_DOWNLOAD)) return;
++  unsigned char b[2000]; int o=0; b[o++]=(unsigned char)state; put_s16(b,&o,(int)sizeof b,nm,250);
++  put_u32(b,&o,size>0&&size<4294967295.0?(uint32_t)size:0); put_s16(b,&o,(int)sizeof b,path,1400);
++  asbc_send(g_cli,ASBC_DOWNLOAD,b,(uint32_t)o); }
++
++/* ---- uploads: the page's file chooser becomes FILEREQ; the client streams FILEPUT; DOM.setFileInputFiles ---- */
++static struct { uint32_t req; int open, multiple, backend, desc_id, nf; char accept[300]; char files[8][800];
++  FILE *f; long long got, size, sum; } g_up;
++static uint32_t g_up_seq;
++static struct { char path[800]; long long t; } g_upkeep[32]; static int g_nupkeep;
++static char g_updir[700];
++static long long app_maxupload(void){ return (long long)env_int("ASB_APP_MAXUPLOAD",25)*1024*1024; }
++static void app_filedone(uint32_t req,int status,const char *msg){
++  fprintf(stderr,"asb-chromed: app: upload %u: %s\n",req,msg);
++  if(!app_can(ASBC_CAP_FILE)) return;
++  unsigned char b[400]; int o=0; put_u32(b,&o,req); b[o++]=(unsigned char)status; put_s16(b,&o,(int)sizeof b,msg,300);
++  asbc_send(g_cli,ASBC_FILEDONE,b,(uint32_t)o); }
++static void up_unlink(const char *path){   /* the file and its own folder */
++  unlink(path); char d[800]; scopy(d,sizeof d,path); char *sl=strrchr(d,'/'); if(sl){ *sl=0; rmdir(d); } }
++static void up_abort(void){
++  if(g_up.f){ fclose(g_up.f); g_up.f=NULL; }
++  for(int i=0;i<g_up.nf;i++) up_unlink(g_up.files[i]);
++  g_up.nf=0; g_up.open=0; }
++static void app_intercept_files(int on){
++  cdp("{\"id\":%d,\"method\":\"Page.setInterceptFileChooserDialog\",\"params\":{\"enabled\":%s}}",cdp_id(),on?"true":"false"); }
++static void app_filereq_send(void){
++  if(!app_can(ASBC_CAP_FILE)){ g_up.open=0; return; }
++  unsigned char b[400]; int o=0; put_u32(b,&o,g_up.req); b[o++]=(unsigned char)(g_up.multiple?1:0); put_s16(b,&o,(int)sizeof b,g_up.accept,300);
++  asbc_send(g_cli,ASBC_FILEREQ,b,(uint32_t)o);
++  fprintf(stderr,"asb-chromed: app: file chooser -> FILEREQ %u (%s, accept \"%s\")\n",g_up.req,g_up.multiple?"multiple":"single",g_up.accept); }
++static int app_file_event(const char *method,const char *msg){
++  if(!strcmp(method,"Page.fileChooserOpened")){
++    if(g_up.open) up_abort();
++    char mode[40]=""; json_str(msg,"mode",mode,sizeof mode);
++    memset(&g_up,0,sizeof g_up); g_up.req=++g_up_seq; g_up.open=1; g_up.multiple=!strcmp(mode,"selectMultiple");
++    g_up.backend=json_int(msg,"backendNodeId",0);
++    g_up.desc_id=cdp_id(); cdp("{\"id\":%d,\"method\":\"DOM.describeNode\",\"params\":{\"backendNodeId\":%d}}",g_up.desc_id,g_up.backend);
++    return 1; }
++  if(!method[0] && g_up.desc_id && json_int(msg,"id",-1)==g_up.desc_id){   /* attributes: [.., "accept", "image/png", ..] */
++    g_up.desc_id=0;
++    const char *a=strstr(msg,"\"attributes\":["); if(a){ a+=14;
++      for(int k=0;k<64 && *a && *a!=']';k++){ char v[300]; const char *q=ja_next(a,v,(int)sizeof v); if(q==a) break; a=q;
++        if(!(k&1) && !strcmp(v,"accept")){ ja_next(a,g_up.accept,(int)sizeof g_up.accept); break; } } }
++    app_filereq_send(); return 1; }
++  return 0; }
++static void app_fileput(const unsigned char *p,int n){
++  if(n<11) return;
++  uint32_t req=get_u32(p); int flags=p[4]; unsigned nl=asbc_get_u16(p+5);
++  if(n<7+(int)nl+4) return;
++  char name[256]; int k=(int)nl<255?(int)nl:255; memcpy(name,p+7,(size_t)k); name[k]=0;
++  uint32_t size=get_u32(p+7+nl); const unsigned char *d=p+11+nl; int dn=n-11-(int)nl;
++  if(!g_up.open || req!=g_up.req){ app_filedone(req,2,"no such file request"); return; }
++  if(flags&2){ up_abort(); app_filedone(req,2,"cancelled"); return; }
++  if(nl){   /* a new file */
++    if(g_up.f){ fclose(g_up.f); g_up.f=NULL; }
++    if(g_up.nf==8 || (g_up.nf && !g_up.multiple)){ up_abort(); app_filedone(req,2,"too many files"); return; }
++    g_up.sum+=size;
++    if((long long)size>app_maxupload() || g_up.sum>app_maxupload()){ char m[120]; snprintf(m,sizeof m,"too big (limit %lld MB)",app_maxupload()/1048576);
++      up_abort(); app_filedone(req,1,m); return; }
++    char sn[256]; app_safe_name(name,sn,sizeof sn); mkdir(g_updir,0700);
++    char sub[600]; snprintf(sub,sizeof sub,"%.500s/%u-%d",g_updir,req,g_up.nf); mkdir(sub,0700);   /* own folder: the page sees the real name */
++    snprintf(g_up.files[g_up.nf],sizeof g_up.files[0],"%.500s/%.200s",sub,sn);
++    int fd=open(g_up.files[g_up.nf],O_WRONLY|O_CREAT|O_TRUNC,0600); g_up.f=fd>=0?fdopen(fd,"wb"):NULL;
++    if(!g_up.f){ up_abort(); app_filedone(req,2,"cannot write the upload on the Host"); return; }
++    g_up.nf++; g_up.got=0; g_up.size=size; }
++  if(!g_up.f && dn>0){ up_abort(); app_filedone(req,2,"data before a file name"); return; }
++  if(dn>0){ if(g_up.got+dn>g_up.size || fwrite(d,1,(size_t)dn,g_up.f)!=(size_t)dn){ up_abort(); app_filedone(req,2,"more data than announced"); return; } g_up.got+=dn; }
++  if(!(flags&1)) return;
++  if(g_up.f){ fclose(g_up.f); g_up.f=NULL; }
++  if(g_up.got!=g_up.size){ up_abort(); app_filedone(req,2,"file incomplete"); return; }
++  static char js[8*1700+200]; int o=0; o+=snprintf(js+o,sizeof js-(size_t)o,"{\"id\":%d,\"method\":\"DOM.setFileInputFiles\",\"params\":{\"files\":[",cdp_id());
++  for(int i=0;i<g_up.nf;i++){ char e[1700]; jsonesc(g_up.files[i],e,sizeof e); o+=snprintf(js+o,sizeof js-(size_t)o,"%s\"%s\"",i?",":"",e);
++    if(g_nupkeep==32){ up_unlink(g_upkeep[0].path); memmove(g_upkeep,g_upkeep+1,sizeof g_upkeep[0]*31); g_nupkeep=31; }
++    scopy(g_upkeep[g_nupkeep].path,sizeof g_upkeep[0].path,g_up.files[i]); g_upkeep[g_nupkeep++].t=now_ms(); }
++  snprintf(js+o,sizeof js-(size_t)o,"],\"backendNodeId\":%d}}",g_up.backend);
++  cdp("%s",js);
++  char m[80]; snprintf(m,sizeof m,"%d file%s handed to the page",g_up.nf,g_up.nf==1?"":"s");
++  g_up.nf=0; g_up.open=0; app_filedone(req,0,m); }
++static void app_upload_tick(void){
++  long long t=now_ms();
++  while(g_nupkeep && t-g_upkeep[0].t>600000){ up_unlink(g_upkeep[0].path); memmove(g_upkeep,g_upkeep+1,sizeof g_upkeep[0]*(size_t)(g_nupkeep-1)); g_nupkeep--; } }
++
++/* ---- client ops ---- */
++static void app_send_appinfo(void){
++  unsigned char b[1400]; int o=0; put_s16(b,&o,(int)sizeof b,g_app_id,60); put_s16(b,&o,(int)sizeof b,g_app_url,1200); put_u32(b,&o,APP_HOSTCAPS);
++  asbc_send(g_cli,ASBC_APPINFO,b,(uint32_t)o); }
++/* returns 1 if the op was an app-mode op (ignored outside app mode, as before) */
++static int app_client_op(int op,const unsigned char *p,int n){
++  if(op!=ASBC_CAPS && op!=ASBC_FOCUS && op!=ASBC_NOTIFYACT && op!=ASBC_FILEPUT) return 0;
++  if(!g_app) return 1;
++  if(op==ASBC_CAPS){ if(n<4) return 1;
++    uint32_t want=get_u32(p); g_app_caps=want&APP_HOSTCAPS;
++    fprintf(stderr,"asb-chromed: app: client caps 0x%x (using 0x%x)\n",want,g_app_caps);
++    app_send_appinfo();
++    app_intercept_files((g_app_caps&ASBC_CAP_FILE)!=0);
++    if(g_app_caps&ASBC_CAP_UNREAD){ memcpy(g_app_unread_sent,g_app_unread,sizeof g_app_unread); g_app_unread_t=now_ms();
++      app_unread_out(g_app_unread[0],g_app_unread[1],g_app_unread[2]); }   /* the latest state, also after a reconnect */
++    return 1; }
++  if(op==ASBC_FOCUS){ if(n>=2 && (g_app_caps&ASBC_CAP_FOCUS)) app_focus(p[0],p[1]); return 1; }
++  if(op==ASBC_NOTIFYACT){ if(n>=5 && (g_app_caps&ASBC_CAP_NOTIFY)) app_notify_act(get_u32(p),p[4]); return 1; }
++  if(op==ASBC_FILEPUT){ if(g_app_caps&ASBC_CAP_FILE) app_fileput(p,n); return 1; }
++  return 1; }
++static void app_proto_init(void){
++  if(!g_app) return;
++  const char *u=getenv("ASB_UPLOADS"); if(u&&u[0]) scopy(g_updir,sizeof g_updir,u); else snprintf(g_updir,sizeof g_updir,"%s/uploads",g_cfg);
++  mkdir(g_updir,0700); }
++static void app_proto_gone(void){ g_app_caps=0; if(g_up.open){ up_abort(); } g_up.desc_id=0; }
+diff --git a/chrome/asbc.h b/chrome/asbc.h
+index 25cdbdb..91128c9 100644
+--- a/chrome/asbc.h
++++ b/chrome/asbc.h
+@@ -54,9 +54,27 @@ enum {
+   ASBC_BMARKS = 45, /* 0.87, host -> client: utf-8 lines "url\ttitle\tfolder" (bookmarks.tsv order); sent after the
+                        client's "bookmarks" cmd and again whenever the list changes. Older clients never ask. */
+   ASBC_SCROLL = 43, /* u16 x,y,w,h, i16 dy: move that page area by dy (content moves up when dy<0) */
+-  /* app mode (ASB_APP, appmode.inc); AmiSurf sessions never get these */
+-  ASBC_OPENURL= 48  /* u16 n, url, u8 reason (0 link, 1 new window, 2 client NAV not allowed): open it outside the app */
++  /* app mode (ASB_APP: appmode.inc, appnotify.inc, appproto.inc). Strings: "str" = u16 n + n bytes UTF-8.
++     Host -> client messages go out only when the client set their bit with ASBC_CAPS; AmiSurf sessions never
++     send CAPS and never get them. */
++  ASBC_CAPS     = 22, /* c->h u32 ASBC_CAP_* the client handles; sent once after FMT. App mode answers with APPINFO */
++  ASBC_FOCUS    = 23, /* c->h u8 focused, u8 visible (0/1): the client window's state (CAP_FOCUS) */
++  ASBC_NOTIFYACT= 24, /* c->h u32 id, u8 action (0 clicked/opened, 1 dismissed by the user) (CAP_NOTIFY) */
++  ASBC_FILEPUT  = 25, /* c->h u32 req, u8 flags (1 last chunk of the request, 2 cancel), str name, u32 size, data
++                         (<= 64 KB per chunk). A chunk with a name starts a file; later chunks of it: name "" (CAP_FILE) */
++  ASBC_NOTIFY   = 45, /* h->c u32 id, u8 kind (0 message, 1 mention, 2 DM, 3 call, 255 other), str title, str body,
++                         str tag, str hint ("#channel, Server"), str url, u8 has_icon [u16 w, u16 h, w*h RGB24, <= 64x64] */
++  ASBC_NOTIFYCLOSE=46,/* h->c u32 id: the page closed it */
++  ASBC_UNREAD   = 47, /* h->c u16 count, u16 mentions, u8 flags (1 unread without mention, 2 favicon badge) */
++  ASBC_OPENURL  = 48, /* h->c str url, u8 reason (0 link, 1 new window, 2 client NAV not allowed): open it outside the
++                         app (CAP_OPENURL; without it the URL goes out as STATUS) */
++  ASBC_FILEREQ  = 49, /* h->c u32 req, u8 flags (1 multiple), str accept: the page opened a file chooser */
++  ASBC_FILEDONE = 50, /* h->c u32 req, u8 status (0 ok, 1 too big, 2 error/cancelled), str message */
++  ASBC_DOWNLOAD = 51, /* h->c u8 state (0 started, 1 done, 2 failed), str name, u32 size, str host path */
++  ASBC_APPINFO  = 52  /* h->c str app id, str start URL, u32 ASBC_CAP_* the Host supports (reply to CAPS) */
+ };
++enum { ASBC_CAP_NOTIFY=1, ASBC_CAP_UNREAD=2, ASBC_CAP_FOCUS=4, ASBC_CAP_OPENURL=8, ASBC_CAP_FILE=16,
++       ASBC_CAP_DOWNLOAD=32, ASBC_CAP_PASTEIMG=64 };
+ 
+ /* FRAME fmt 3 payload (after the 12 header bytes and fmt=3): u8 pixfmt (ASBC_PF_*, the format announced with ASBC_FMT),
+    u8 comp (0 raw, 1 RLE), then tw*th pixels in that format (asbc_pf_bpp bytes each).
+diff --git a/chrome/features.inc b/chrome/features.inc
+index e2f352c..7e41354 100644
+--- a/chrome/features.inc
++++ b/chrome/features.inc
+@@ -562,18 +562,18 @@ static int feat_event(const char *method,const char *msg){
+     if(gu[0] && dl_find(gu)) return 1;
+     if(g_ndl==32){ memmove(g_dl,g_dl+1,sizeof g_dl[0]*31); g_ndl=31; }
+     dl_t *d=&g_dl[g_ndl++]; memset(d,0,sizeof *d); scopy(d->guid,sizeof d->guid,gu); scopy(d->name,sizeof d->name,fn); json_str(msg,"url",d->url,sizeof d->url); d->t=time(NULL);
+-    char st[900]; snprintf(st,sizeof st,"Downloading %s to %s",fn,dl_where()); send_status(st);
++    char st[900]; snprintf(st,sizeof st,"Downloading %s to %s",fn,dl_where()); send_status(st); app_download(gu,fn,0,0);
+     fprintf(stderr,"asb-chromed: download %s -> %s\n",fn,g_dlpath); return 1; }
+   if(!strcmp(method,"Browser.downloadProgress")){
+     char gu[64]="", st[40]=""; json_str(msg,"guid",gu,sizeof gu); json_str(msg,"state",st,sizeof st);
+     dl_t *d=dl_find(gu); if(!d || d->state) return 1;
+     const char *p=strstr(msg,"\"receivedBytes\":"); if(p) d->got=atof(p+16);
+     p=strstr(msg,"\"totalBytes\":"); if(p) d->total=atof(p+13);
+-    if(!strcmp(st,"completed")){ d->state=1; if(d->total<=0) d->total=d->got; dl_finish(d); char s[900]; snprintf(s,sizeof s,"Downloaded %s (%.0f KB) to %s",d->name,d->got/1024.0,dl_where()); send_status(s);
++    if(!strcmp(st,"completed")){ d->state=1; if(d->total<=0) d->total=d->got; dl_finish(d); char s[900]; snprintf(s,sizeof s,"Downloaded %s (%.0f KB) to %s",d->name,d->got/1024.0,dl_where()); send_status(s); app_download(d->guid,d->name,1,d->total);
+       fprintf(stderr,"asb-chromed: downloaded %s/%s (%.0f bytes)\n",g_dlpath,d->name,d->got); }
+     else if(!strcmp(st,"canceled")){ d->state=2; dl_finish(d); char s[600];
+       /* Chrome reports a failed download (network error, server error, disk full) as canceled too */
+-      snprintf(s,sizeof s,"Download failed or canceled: %s (%.0f KB received) - see the Downloads page",d->name,d->got/1024.0); send_status(s);
++      snprintf(s,sizeof s,"Download failed or canceled: %s (%.0f KB received) - see the Downloads page",d->name,d->got/1024.0); send_status(s); app_download(d->guid,d->name,2,d->got);
+       fprintf(stderr,"asb-chromed: download failed/canceled %s\n",d->name); }
+     else { static time_t last; time_t now=time(NULL); if(now!=last){ last=now; char s[400];
+         if(d->total>0) snprintf(s,sizeof s,"Downloading %s  %d%%  (%.1f of %.1f MB)",d->name,(int)(d->got*100/d->total),d->got/1048576.0,d->total/1048576.0);
+diff --git a/chrome/host.c b/chrome/host.c
+index 43994d8..042f6fc 100644
+--- a/chrome/host.c
++++ b/chrome/host.c
+@@ -52,7 +52,8 @@ static void hist_note(void); static void display_url(const char *in,char *out,in
+ static int g_bidi; static char g_ctx[80]; /* Firefox backend (bidi.inc) */
+ static void bidi_from_cdp(const char *cmd); static int bidi_tree(void); static int bidi_tab_create(const char *url); static void bidi_tab_close(const char *ctx);
+ /* app mode (appmode.inc, ASB_APP): off for AmiSurf */
+-static int g_app, g_app_vis=1; static void app_client_hello(void); static void app_client_gone(void); static void app_enable(void); static int app_cmd(char *c,char *arg); static int app_nav(const char *u);
++static int g_app, g_app_vis=1; static void app_download(const char *guid,const char *name,int state,double size);
++static int app_client_op(int op,const unsigned char *p,int n); static void app_proto_init(void); static void app_client_hello(void); static void app_client_gone(void); static void app_enable(void); static int app_cmd(char *c,char *arg); static int app_nav(const char *u);
+ static int app_event(const char *method,const char *msg); static int app_hold(unsigned char *rgb,int iw,int ih);
+ static void app_tick(void); static void app_init(void); static void app_bws_read(void); static void app_bws_close(void);
+ static void app_close_chrome(void); static void app_logout(void);
+@@ -697,6 +698,7 @@ static int g_mx, g_my;
+ static int browser_switch(int want);
+ static void on_client(int op, unsigned char *p, int n){
+   if(op!=ASBC_MOUSE) fprintf(stderr,"asb-chromed: op %d n=%d\n",op,n);
++  if(app_client_op(op,p,n)) return;   /* CAPS, FOCUS, NOTIFYACT, FILEPUT: app mode only, ignored otherwise as before */
+   switch(op){
+   case ASBC_HELLO:
+     if(n>=5 && p[4] && p[4]!=(g_bidi?2:1) && !g_app){ g_vw=asbc_get_u16(p); g_vh=asbc_get_u16(p+2); browser_switch(p[4]); } /* BROWSER= from the client */
+@@ -1053,7 +1055,7 @@ int main(int argc, char **argv){
+   g_dbg=dbg; if(!g_bidiport) g_bidiport=dbg+100;
+   app_init(); if(g_app){ g_want=1; if(g_app_mute) setenv("ASB_AUDIO","0",1);   /* app mode: Chrome only; muted = no audio sink */
+     if(!profile_set) snprintf(profile,sizeof profile,"%s/.config/amistudio-chrome-%s",home,g_app_id); }   /* never AmiSurf's profile */
+-  feat_init(asbc);
++  feat_init(asbc); app_proto_init();
+   const char *dlenv=getenv("ASB_DOWNLOADS");
+   if(dlenv&&dlenv[0]) snprintf(g_dlpath,sizeof g_dlpath,"%s",dlenv);
+   else if(access("/opt/amikit/AmiKit",F_OK)==0)
+@@ -1076,7 +1078,7 @@ int main(int argc, char **argv){
+   send_status("waiting for client");
+ 
+   buf_t wsbuf={0};
+-  unsigned char msg[65536];
++  static unsigned char msg[65536+4096];   /* FILEPUT: 64 KB of data + its header */
+   for(;;){
+     fd_set rf; FD_ZERO(&rf);
+     int m=g_listen; FD_SET(g_listen,&rf);

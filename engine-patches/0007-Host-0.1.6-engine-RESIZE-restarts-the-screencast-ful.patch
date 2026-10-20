@@ -1,0 +1,159 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: "Grok Bot (for Rich)" <hardcopi@users.noreply.github.com>
+Date: Sun, 18 Oct 2026 09:40:24 -0400
+Subject: [PATCH] Host 0.1.6 engine: RESIZE restarts the screencast; full-size
+ frames under zoom (no re-applying viewport loop); app mode resets zoom/find
+ for a new client (asbhost client KEY), keeps it for the same client
+
+---
+ chrome/appnotify.inc |  7 +++++++
+ chrome/features.inc  |  5 ++++-
+ chrome/host.c        | 42 +++++++++++++++++++++++++++++++++++++++---
+ 3 files changed, 50 insertions(+), 4 deletions(-)
+
+diff --git a/chrome/appnotify.inc b/chrome/appnotify.inc
+index b770118..12149a1 100644
+--- a/chrome/appnotify.inc
++++ b/chrome/appnotify.inc
+@@ -286,6 +286,13 @@ static int app_notify_event(const char *method,const char *msg){
+ /* app-mode client lifecycle */
+ static void app_client_hello(void){   /* before HELLO starts the screencast */
+   if(!g_app) return; g_app_foc=1; g_app_vis=1;
++  /* 0.1.6: per-client view state (zoom, find) starts fresh for a new client; the same client reconnecting (the Host's
++     takeover of a dropped session, same KEY) keeps it. Decided once per connection, at its first HELLO. */
++  if(!g_cli_decided){ g_cli_decided=1;
++    int same=g_cli_key[0] && !strcmp(g_cli_key,g_last_cli_key);
++    if(!same){ g_zoom=g_defzoom; g_findq[0]=0; g_findcur=g_findtot=0; }
++    fprintf(stderr,"asb-chromed: app: %s client: zoom %d%%\n",same?"same":"new",g_zoom);
++    scopy(g_last_cli_key,sizeof g_last_cli_key,g_cli_key); }
+   cdp("{\"id\":%d,\"method\":\"Emulation.setFocusEmulationEnabled\",\"params\":{\"enabled\":true}}",cdp_id());
+   app_to_shim("[\"focus\",1,1]"); memset(g_app_unread_sent,0xff,sizeof g_app_unread_sent); g_app_unread_t=0; }
+ static void app_client_gone(void){ if(!g_app) return; app_proto_gone(); app_focus(0,0); }
+diff --git a/chrome/features.inc b/chrome/features.inc
+index 7e41354..4dd83e1 100644
+--- a/chrome/features.inc
++++ b/chrome/features.inc
+@@ -286,7 +286,7 @@ static void pw_binding(const char *payload){
+ /* ---- zoom ---- */
+ static void send_zoom(void){ if(g_cli<0) return; unsigned char b[2]; asbc_put_u16(b,(unsigned)g_zoom); asbc_send(g_cli,ASBC_ZOOM,b,2); }
+ static void set_zoom(int z){
+-  if(z<25) z=25; if(z>400) z=400; g_zoom=z;
++  if(z<25) z=25; if(z>400) z=400; g_zoom=z; g_view_set_ms=now_ms();
+   cdp_viewport(g_vw,g_vh);
+   if(g_screencast_on){ cdp_screencast(0); cdp_screencast(1); }
+   free(g_prev); g_prev=NULL; g_prev_w=g_prev_h=0;
+@@ -492,6 +492,9 @@ static void ban_fail(uint32_t ip){
+ static void do_cmd(char *c){
+   char *arg=strchr(c,' '); if(arg) *arg++=0; else arg="";
+   int i;
++  /* "asbhost client KEY": sent by the AmiStudio Host as the first frame of a session (0.1.6); KEY identifies the
++     client (paired token, or client id + address), so app mode can tell a reconnect of the same client from a new one */
++  if(!strcmp(c,"asbhost")){ if(!strncmp(arg,"client ",7) && !g_cli_decided) scopy(g_cli_key,sizeof g_cli_key,arg+7); return; }
+   if(app_cmd(c,arg)) return;   /* app mode: only zoom/find/ctx/avdelay and "app ..." */
+   if(!strcmp(c,"zoom")){ if(!strcmp(arg,"+")) set_zoom(zoom_step(1)); else if(!strcmp(arg,"-")) set_zoom(zoom_step(-1)); else if(!strcmp(arg,"0")) set_zoom(100); else set_zoom(atoi(arg)); }
+   else if(!strcmp(c,"findnext")) find_run(1,0);
+diff --git a/chrome/host.c b/chrome/host.c
+index 4537358..83e069b 100644
+--- a/chrome/host.c
++++ b/chrome/host.c
+@@ -48,6 +48,15 @@ static struct { char id[80], ws[300], url[2400], title[128]; } g_tabs[MAXTAB];
+ static int g_ntab, g_tab;
+ static unsigned char *g_prev; static int g_prev_w, g_prev_h;
+ static int g_zoom; static char g_order[MAXTAB][80]; static int g_norder;
++/* zoom-in (0.1.6 engine patch 0007): Chrome's screencast frames are in CSS (DIP) pixels, so under a device-scale
++   zoom > 100 they come at the unzoomed size (view*100/zoom). They are then only a change signal: the frame that goes
++   to the client is a Page.captureScreenshot, which Chrome renders at the full device size (view w x h, sharp).
++   One screenshot in flight; a DIP frame identical to the last one (e.g. caused by the screenshot itself) is ignored.
++   Zoom-out frames are normally the view size already (maxWidth caps them; +-3 px rounding is fitted in frame_png); a
++   stray wrong-size frame right after a zoom change takes the same screenshot path instead of re-applying the viewport. */
++static int g_zshot_id, g_zshot_more; static uint32_t g_zshot_hash;
++static char g_cli_key[80], g_last_cli_key[80]; static int g_cli_decided;
++static long long now_ms(void); static long long g_view_set_ms;   /* last zoom/resize: frames of the old screencast may still arrive for a moment (not a viewport fault) */   /* app mode: who the client is (Host's "asbhost client KEY") */
+ static void hist_note(void); static void display_url(const char *in,char *out,int cap); static void feat_enable(void);
+ static int g_bidi; static char g_ctx[80]; /* Firefox backend (bidi.inc) */
+ static void bidi_from_cdp(const char *cmd); static int bidi_tree(void); static int bidi_tab_create(const char *url); static void bidi_tab_close(const char *ctx);
+@@ -296,6 +305,7 @@ static void cdp_screencast(int on){
+   int i=cdp_id();
+   if(on){
+     free(g_prev); g_prev=NULL; /* next frame goes out whole (new client, new tab or restarted cast) */
++    g_zshot_hash=0; g_zshot_more=0;
+     cdp("{\"id\":%d,\"method\":\"Page.startScreencast\",\"params\":{\"format\":\"png\",\"maxWidth\":%d,\"maxHeight\":%d,\"everyNthFrame\":2}}",i,g_vw>0?g_vw:1280,g_vh>0?g_vh:720);
+     g_screencast_on=1; }
+   else {
+@@ -519,6 +529,12 @@ static void frame_png(int n){
+   int iw,ih,comp;
+   unsigned char *rgb=stbi_load_from_memory(g_cap,n,&iw,&ih,&comp,3);
+   if(!rgb || iw<1 || ih<1){ free(rgb); return; }
++  /* under zoom Chrome's rounding of CSS size x scale can be a pixel or two off the view: fit it exactly (0.1.6) */
++  if(g_zoom!=100 && (iw!=g_vw||ih!=g_vh) && abs(iw-g_vw)<=3 && abs(ih-g_vh)<=3){
++    unsigned char *f=malloc((size_t)g_vw*g_vh*3);
++    if(f){ for(int y=0;y<g_vh;y++){ const unsigned char *src=rgb+(size_t)(y<ih?y:ih-1)*iw*3; unsigned char *d=f+(size_t)y*g_vw*3;
++        int cw=iw<g_vw?iw:g_vw; memcpy(d,src,(size_t)cw*3); for(int x=cw;x<g_vw;x++) memcpy(d+x*3,src+(iw-1)*3,3); }
++      free(rgb); rgb=f; iw=g_vw; ih=g_vh; } }
+   if(g_app && app_hold(rgb,iw,ih)) return;   /* app mode, reduced motion: frame throttling */
+   frame_rgb(rgb,iw,ih,n);
+ }
+@@ -549,6 +565,9 @@ static void vq_pump(void){
+    Workbench window kept showing the old layout): if none came, grab one screenshot and send it as a frame */
+ static long long g_kick_due; static long g_kick_seen; static int g_kick_id;
+ static void kick_arm(void){ if(!g_bidi){ g_kick_due=us_now()+600000; g_kick_seen=g_frames_seen; } }
++static void zoom_shot(void){   /* full-size frame under zoom (see g_zshot_id) */
++  if(g_zshot_id){ g_zshot_more=1; return; }
++  g_zshot_id=cdp_id(); cdp("{\"id\":%d,\"method\":\"Page.captureScreenshot\",\"params\":{\"format\":\"png\",\"optimizeForSpeed\":true}}",g_zshot_id); }
+ static void kick_tick(void){
+   if(!g_kick_due || us_now()<g_kick_due) return;
+   g_kick_due=0; if(g_bidi || g_cli<0 || g_frames_seen!=g_kick_seen) return;
+@@ -557,6 +576,11 @@ static void on_cdp(const char *msg){
+   char method[80]; if(!json_str(msg,"method",method,sizeof method)) method[0]=0;
+   if(!method[0] && g_kick_id && json_int(msg,"id",-1)==g_kick_id){ g_kick_id=0;
+     int n=json_b64_field(msg,"data",g_cap,(int)sizeof g_cap); if(n>0 && g_frames_seen==g_kick_seen){ free(g_prev); g_prev=NULL; frame_png(n); } return; }
++  if(!method[0] && g_zshot_id && json_int(msg,"id",-1)==g_zshot_id){ g_zshot_id=0;
++    int n=json_b64_field(msg,"data",g_cap,(int)sizeof g_cap);
++    if(n>0 && g_cli>=0 && g_screencast_on && g_zoom!=100){ g_frames_seen++; g_cap_ms=wall_ms(); frame_png(n); }
++    if(g_zshot_more){ g_zshot_more=0; zoom_shot(); }
++    return; }
+   if(g_app && app_event(method,msg)) return;
+   if(!method[0] && feat_reply(msg)) return;
+   if(method[0] && feat_event(method,msg)) return;
+@@ -568,10 +592,19 @@ static void on_cdp(const char *msg){
+     /* element fullscreen (video maximise) and leaving it make Chrome drop our metrics override, so frames come at the
+        host screen's size/aspect: put the client's viewport back (rate-limited) */
+     int skip=0;
++    if(g_zoom!=100 && n>24 && !memcmp(g_cap+12,"IHDR",4) && g_vw>0 && g_vh>0){
++      int pw=(g_cap[16]<<24)|(g_cap[17]<<16)|(g_cap[18]<<8)|g_cap[19], ph=(g_cap[20]<<24)|(g_cap[21]<<16)|(g_cap[22]<<8)|g_cap[23];
++      if(abs(pw-g_vw)>3||abs(ph-g_vh)>3){   /* a DIP-size (or stale) frame under zoom: take a full-size screenshot instead (zoom_shot);
++                                              never "re-apply the viewport" for it, that only looped (AmiDiscord 0.1.4 finding) */
++        int i=cdp_id(); cdp("{\"id\":%d,\"method\":\"Page.screencastFrameAck\",\"params\":{\"sessionId\":%d}}",i,sid);
++        uint32_t hsh=2166136261u; for(int k=0;k<n;k++) hsh=(hsh^g_cap[k])*16777619u;
++        if(hsh!=g_zshot_hash){ g_zshot_hash=hsh; zoom_shot(); }
++        return; } }
+     if(n>24 && !memcmp(g_cap+12,"IHDR",4) && g_vw>0 && g_vh>0 && !getenv("ASB_NO_VIEWFIX")){
+       int pw=(g_cap[16]<<24)|(g_cap[17]<<16)|(g_cap[18]<<8)|g_cap[19], ph=(g_cap[20]<<24)|(g_cap[21]<<16)|(g_cap[22]<<8)|g_cap[23];
+       static long long fixat;
+-      if((pw!=g_vw||ph!=g_vh) && now_ms()-fixat>400){ fixat=now_ms(); fprintf(stderr,"asb-chromed: frame %dx%d != view %dx%d, re-applying viewport\n",pw,ph,g_vw,g_vh); cdp_viewport(g_vw,g_vh); }
++      if(g_zoom!=100 && abs(pw-g_vw)<=3 && abs(ph-g_vh)<=3) pw=g_vw, ph=g_vh;   /* zoom rounding: frame_png fits it */
++      if((pw!=g_vw||ph!=g_vh) && now_ms()-fixat>400 && now_ms()-g_view_set_ms>1000){ fixat=now_ms(); fprintf(stderr,"asb-chromed: frame %dx%d != view %dx%d, re-applying viewport\n",pw,ph,g_vw,g_vh); cdp_viewport(g_vw,g_vh); }
+       /* hold back wrong-size frames while the fix lands (at most 2 s, then show whatever Chrome gives) */
+       static long long mis; if(pw!=g_vw||ph!=g_vh){ if(!mis) mis=now_ms(); skip=now_ms()-mis<2000; } else mis=0; }
+     if(skip){ int i=cdp_id(); cdp("{\"id\":%d,\"method\":\"Page.screencastFrameAck\",\"params\":{\"sessionId\":%d}}",i,sid); return; }
+@@ -709,7 +742,10 @@ static void on_client(int op, unsigned char *p, int n){
+   case ASBC_AUDIOCTL: if(n>=1){ g_au_on=p[0]!=0; if(g_au_on) audio_start_cap(); else audio_stop_cap(); } break;
+   case ASBC_FMT: on_fmt(p,n); inflight_reset(); free(g_pend); g_pend=NULL; if(g_screencast_on){ cdp_screencast(0); cdp_screencast(1); } kick_arm(); break;
+   case ASBC_RESIZE:
+-    if(n>=4){ cdp_viewport(asbc_get_u16(p), asbc_get_u16(p+2)); kick_arm(); }
++    /* 0.1.6: restart the screencast too: its maxWidth/maxHeight are fixed at start, so after growing the view Chrome
++       kept scaling frames down to the old size (FMT, which also restarts it, was the clients' workaround) */
++    if(n>=4){ g_view_set_ms=now_ms(); cdp_viewport(asbc_get_u16(p), asbc_get_u16(p+2)); inflight_reset(); free(g_pend); g_pend=NULL;
++      if(g_screencast_on){ cdp_screencast(0); cdp_screencast(1); } kick_arm(); }
+     break;
+   case ASBC_NAV:{
+     char u[2400]; int m=n<(int)sizeof u-1?n:(int)sizeof u-1; memcpy(u,p,(size_t)m); u[m]=0;
+@@ -1123,7 +1159,7 @@ int main(int argc, char **argv){
+         if(hs){ static time_t lastlog; static int quiet; time_t now=time(NULL);
+           if(now!=lastlog){ fprintf(stderr,"asb-chromed: client %s rejected (%s)%s\n",inet_ntoa(a.sin_addr),hs==-2?"bad token":"bad handshake",quiet?" [more suppressed]":""); lastlog=now; quiet=0; } else quiet++;
+           ban_fail(a.sin_addr.s_addr); close(c); }
+-        else { if(g_cli>=0){ const char *rm="replaced by another client"; asbc_send(g_cli,ASBC_STATUS,rm,(uint32_t)strlen(rm)); close_cli(); } g_cli=c; g_bm_want=0; pf_reset(); inflight_reset(); g_vlat_ms=0; g_avdelay_ms=0; vq_clear(); free(g_pend); g_pend=NULL; fprintf(stderr,"asb-chromed: client connected\n"); send_status("connected"); }
++        else { if(g_cli>=0){ const char *rm="replaced by another client"; asbc_send(g_cli,ASBC_STATUS,rm,(uint32_t)strlen(rm)); close_cli(); } g_cli=c; g_bm_want=0; g_cli_key[0]=0; g_cli_decided=0; pf_reset(); inflight_reset(); g_vlat_ms=0; g_avdelay_ms=0; vq_clear(); free(g_pend); g_pend=NULL; fprintf(stderr,"asb-chromed: client connected\n"); send_status("connected"); }
+       }
+     }
+     if(g_cli>=0 && FD_ISSET(g_cli,&rf)){

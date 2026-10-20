@@ -1,0 +1,26 @@
+# AmiStudio Host as a systemd *user* service (runs as you; the bundled browser engine keeps its data in
+# ~/.local/share/amistudio-host/browser and is stopped with the Host).
+#   install:  dist/install-user.sh   (or copy to ~/.config/systemd/user/ and run the two commands below)
+#   systemctl --user daemon-reload && systemctl --user enable --now amistudio-host
+#   start at boot without logging in:  loginctl enable-linger $USER
+#   log:      journalctl --user -u amistudio-host -f
+# --lan lets real Amigas on your network connect after pairing (amistudio-hostd pair). Remove it to serve only an
+# emulator on this PC. Never forward port 9220 to the internet. Do not run the Host on a public server.
+[Unit]
+Description=AmiStudio Host (serves AmiStudio apps to Amigas on the LAN)
+Documentation=https://github.com/hardcopi/AmiStudio-Host
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/amistudio-hostd run --lan
+Restart=on-failure
+RestartSec=3
+KillMode=control-group
+TimeoutStopSec=15
+NoNewPrivileges=yes
+UMask=0077
+
+[Install]
+WantedBy=default.target

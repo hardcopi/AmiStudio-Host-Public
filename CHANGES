@@ -1,0 +1,235 @@
+AmiStudio Host - changes
+
+0.1.10 (2026-10-19) - fix: the Host crashed at "Sign in..." on Fedora 44 / Nobara
+- Crash fix (Rich, Nobara, AmiDrive 0.1.2 "Sign in..." -> "Service Crash: amistudio-hostd"): the static release
+  binary resolved accounts.google.com for the 0.1.9 sign-in check with glibc's getaddrinfo, which in a static
+  program dlopen()s the system's NSS modules (Fedora: hosts: files myhostname resolve [!UNAVAIL=return] dns).
+  libnss_myhostname.so.2 pulled in Fedora 44's own libc.so.6 (newer glibc than the Host was linked with), which died
+  with SIGFPE (divide by zero) in __libc_early_init and took the whole Host down, for every sign-in method (0, 1, 2).
+  Host 0.1.8 never looked up a name itself (rclone and Chromium resolve their own), so it was not affected.
+  Now names are looked up by the system's `getent ahosts` in a child process (the system's NSS with the system's
+  libc), numeric addresses with inet_pton, localhost directly (src/plat_posix.c plat_resolve; client/ashc.c inside
+  the Host uses the same). The static build wraps glibc's NSS calls (getaddrinfo, gethostbyname*, getnameinfo,
+  getservby*, getpw*, getgr*; also the ones OpenSSL references) to src/nss_off.c with -Wl,--wrap, so no NSS code is
+  linked at all. No getent on a system: names cannot be resolved (logged as "cannot connect"), the Host stays up.
+- The sign-in check now gives up after 8 s (connect and read) instead of 15 + 30 s, then the sign-in goes on.
+- Tests: the static binary (and the tarball's) contains no NSS symbols or NSS loader strings; under bwrap with an
+  nsswitch.conf whose test NSS module crashes when loaded into amistudio-hostd (and resolves the check's host name
+  in getent), AUTH_START 2 reaches the fake Google by name and the Host stays up (test build and static binary);
+  sign-in check answers: chunked 400 refusal, odd bytes, empty, endless redirects, no answer (8 s) - no crash, only a
+  real "Error 4xx: code" page refuses. Also checked by hand: the shipped 0.1.9 vs this build in a Fedora 44 container
+  rootfs (its own nsswitch.conf and glibc): 0.1.9 exits with SIGFPE on AUTH_START 0/1/2, this build answers; and
+  under -fsanitize=address,undefined (no reports).
+
+0.1.9 (2026-10-19) - Google sign-in in AmiSurf, sign-in check, AmiSurf 0.87 engine
+- Bundled browser engine: AmiSurf 0.87's asb-chromed (hardcopi/amistudio-browser 6493b84, was 0.85 e762b82), with
+  the Host's 7 engine patches rebased (conflicts only in asbc.h's message enum and host.c's client-connect line, both
+  sides kept). New in the engine: ASBC_BMARKS (45) - the bookmark list (`url<TAB>title<TAB>folder` lines) after the
+  client's `bookmarks` command and whenever it changes, for AmiSurf 0.87's bookmarks bar and Bookmarks menu; an
+  optional 4th folder column in bookmarks.tsv (Folder field on the internal Bookmarks page; older engines keep it);
+  the internal pages server closes idle (preconnected) sockets without replying (a 403 on one was shown as the next
+  page). Chromium unchanged (ungoogled-chromium 155.0.8059.79-1). tools/fetch-engine.sh, engine-patches/, docs.
+- amidrive AUTH_START 2: the sign-in URL for the Host's own browser engine, so AmiDrive can open it in AmiSurf on the
+  Amiga (the engine runs on this PC, so Google's redirect to 127.0.0.1:53682 reaches rclone). Without a browser engine
+  method 2 is still URL-only (the URL works in any browser on this PC); Hosts up to 0.1.8 treat 2 as 0.
+  `amistudio-hostd amidrive signin --amisurf`.
+- AUTH 0 gains a trailing flags byte (1 = this Host has a browser engine, 2 = the desktop browser of a method-0
+  sign-in could not open); clients that ignore it are unaffected. Sessions joining a sign-in with AUTH_START 1/2 get
+  the URL (also for a running desktop sign-in), never AUTH 1. Refusal texts shortened to ~140 bytes; the AUTH 2/3
+  text always equals the RESULT message.
+- Sign-in check: before rclone starts the Host asks Google whether it accepts the AmiStudio OAuth client with
+  rclone's redirect. Google refusing it (the shipped 0.1.8 client answers "Error 400: redirect_uri_mismatch") now
+  ends the sign-in at once with that reason instead of a browser on Google's error page. `amidrive_auth_check no`
+  turns it off. The request carries the public client ID only.
+- Tests: the check against a local HTTPS stand-in for Google (refusal, pass, off), AUTH_START 2 with and without a
+  browser engine, flags byte, joiners (URL vs step), refusal length = RESULT text, cancel, no secret in argv or logs.
+
+0.1.8 (2026-10-19) - Google Drive (amidrive)
+- New built-in service `amidrive` v1 (src/svc_amidrive.c; docs/PROTOCOL.md "amidrive v1", docs/SERVICES.md
+  "Google Drive"): mounts Google Drive with the bundled rclone 1.75.2 through FUSE at `amidrive_mountpoint` (the
+  launcher: `<AmiStudio drawer>/Google Drive`), for AmiDrive and the launcher. Sign-in in the PC's desktop browser
+  (`rclone authorize drive` with the real desktop environment), status/flush/unmount through rclone's rc, open-file
+  refusal with a path list, pending uploads kept in `{state}/amidrive/cache/`, `Drive.mount` marker
+  (tab-separated, path last), drawer icon parked/placed, `--drive-use-trash` always on, non-empty mount point
+  refused, copied/moved drawer detected (`drawer.path`; a copy's cache is set aside), `invalid_grant` -> sign-in
+  expired, leftover rclone/stale mount cleared at start, rclone crash -> lazy unmount + one retry, one
+  mount/unmount/flush/sign-out at a time (others get busy), `amidrive.lock` so two Hosts never share one Drive.
+  Lifecycle (Rich, 19.10.2026): mounted only when AmiStudio/AmiDrive start (CONNECT flag 1), flushed and unmounted
+  when the Host stops; `amidrive_keeps_host` (default no).
+- CONNECT right after the last file of a lazily unmounted Drive was closed waits up to 3 s for that rclone to end
+  (was: busy at once while it was still exiting).
+- CLI: `amistudio-hostd amidrive status|signin|connect|flush|unmount [--force|--later]|signout`, also in ash-cli.
+- Services may have `busy()` (keeps the Host up without a client; CONFDIR/busy for the launcher's watcher) and
+  `init()` hooks; all services now stop in parallel on shutdown.
+- host-defaults.conf next to the binary (read before host.conf): the release tarball's AmiStudio OAuth client. The
+  client secret is filled in from AMIDRIVE_CLIENT_SECRET by dist/mktarball.sh only (empty if unset).
+- http.c: http_req (any method, headers, body) for the token revoke and the account lookup.
+- config: `#` inside "double quotes" is no longer a comment; quoted values are unquoted.
+- Release tarball: engine/rclone/rclone, LICENSES/rclone-COPYING.txt + RCLONE-VERSION.txt (tools/fetch-rclone.sh,
+  sha256-pinned), services/amidrive/Google Drive.info (from the AmiDrive release), host-defaults.conf (0600).
+  The Host is GPL v3 (LICENSES/GPL-3.0.txt; mktarball.sh no longer says "licence not chosen").
+- Docs: INSTALL.md (fuse3, desktop-browser sign-in, files), PROTOCOL.md, SERVICES.md.
+- Tests: test/amidrive_tests.py (80 checks with an rclone alias remote of a local folder: space in the path, kill
+  and restart, pending uploads, open files, non-empty mount point, copied/moved drawer, stop-on-quit, keeps_host,
+  sign-in URL/cancel without the secret on argv or in logs, expired token, self-contained scan).
+
+Also in 0.1.8 (docs and tests since 0.1.7):
+- Documented the self-contained install the AmiStudio launcher (0.1.8+) uses on AmiKit: everything under its
+  AmiStudio/Host drawer via --confdir, data_dir/--data-dir, ASB_DOWNLOADS, HOME, XDG_* and TMPDIR (docs/INSTALL.md
+  "Self-contained install"; run-host.sh header). The standalone Linux install (~/.config, ~/.local/share, systemd
+  user unit) is unchanged; its Files table now also lists what Chromium, fontconfig, PulseAudio and NSS keep.
+- Test: app_tests selfcontained_tests (both bundled services with everything under one folder: profiles, Host id,
+  downloads and Chromium's HOME/TMPDIR files inside it, nothing Chromium-like new in the real ~ or /tmp).
+- Tests no longer leave PulseAudio daemons behind (one per throw-away HOME used to stay running after every
+  ASH_TEST_BROWSER=1 run): test/pulse_guard.py passes the user's own PULSE_SERVER/PULSE_COOKIE to the test engines
+  (as the launcher's run-host.sh does), turns libpulse autospawn off, and at the end (and at exit) stops any
+  pulseaudio whose HOME is under that run's test folder, nothing else. New checks: no daemon started under the test
+  HOME, none left behind. The self-contained test counts the user's own daemon updating ~/.config/pulse as allowed.
+
+0.1.7 (2026-10-18) - bundled engine on AmiSurf 0.85
+- Bundled engine moved from AmiSurf 0.83 (bd10794) to AmiSurf 0.85 (e762b82 on AmiSurf main, the published
+  0.85 engine). AmiSurf (browser service): download status from a browser-wide CDP connection
+  ("Downloading NAME to FOLDER", "Downloaded NAME (N KB) to FOLDER", failed/canceled), tabs the page opens
+  (target=_blank, window.open, context menu) shown at once and sent as TABS, window.open popups no longer blank, a
+  popup that closes itself falls back to its opener, a fresh frame when switching to a background tab.
+- That browser-wide connection is off in app mode (AmiDiscord): app popups are still caught and closed, app
+  downloads keep their names and DOWNLOAD messages.
+- Engine patches 0001-0007 rebased onto e762b82 (same changes; 0002 also keeps AmiSurf's browser connection off in
+  app mode). Tests: app_tests tabs_tests (browser mode: new tab, popup, popup closing, tab switch frame, download
+  status + file, one event per download), app mode checks that the connection stays off; bundle tests take the
+  folder name from the tarball.
+
+0.1.6 (2026-10-18) - AmiDiscord view findings against 0.1.4; quit-when-unused for the launcher
+- RESIZE restarts the screencast at the new size: frames are the new view size at once (they came scaled down to
+  the old size, e.g. 571x400 for 1000x700, until FMT was re-sent). Re-sending FMT still works.
+- Zoom: frames are always exactly the view size with the content magnified (zoom-in gave unzoomed CSS-size frames,
+  500x350 at 200 % in a 1000x700 view) and the engine's "frame != view, re-applying viewport" log loop is gone.
+  Under zoom the frames are full-size screenshots (one in flight); zoom rounding (+-3 px) is fitted exactly.
+- App mode: a new client starts at the default zoom with no find state; the same client reconnecting or taking
+  its slot over keeps them. The Host tells asbc2 backends who the client is (first frame: CMD "asbhost client
+  KEY", same identity as the session-slot rule); older engines ignore it.
+- New built-in service `control` v1 (paired or loopback, like fetch): QUIT_WHEN_UNUSED [u16 grace s, default 10],
+  QUIT_CANCEL, QUIT_STATUS -> QUIT_STATE u8 state u16 others u16 grace. No other client -> the Host stops at once
+  (engines close Chromium cleanly, exit 0); else it stops grace seconds after the last client, also with exit_idle
+  off; a reconnect within the grace keeps it up. hostinfo lists `service control 1 up`; older Hosts answer status 2.
+  `allow_quit no` / `--no-remote-quit` turns it off (always-on Hosts).
+- Engine patch 0007 (patches 0001-0006 unchanged). docs/PROTOCOL.md "control v1" and "View size, zoom and
+  per-client state (0.1.6)". New tests: app_tests view_tests (app + browser mode), control tests in run_tests.py.
+
+0.1.5 (2026-10-18) - fixes from AmiDiscord's tests against 0.1.4
+- FILEPUT cancel needs only u32 req + u8 flags=2 (5 bytes); the full 11-byte form stays valid. A truncated
+  non-cancel FILEPUT header ends the request with FILEDONE 2 instead of being dropped silently.
+- UNREAD: no unread state (count, dot or favicon badge) on logged-out pages (`/`, `/login`, `/register`, `/reset`,
+  `/verify`; `ASB_APP_NOUNREAD`): Discord's login page favicon swap was reported as a badge. The plain favicon is
+  learned again after login (also for Discord's in-page /login -> /channels navigation).
+- APPINFO gets a u32 max upload in bytes after the caps (ASB_APP_MAXUPLOAD, clamped 1..4095 MB). Appended, so
+  0.1.4-era clients still parse it; clients must ignore trailing bytes.
+- OPENURL url at most 1023 bytes (fits AmiDiscord's 1024-byte buffer); a longer URL is never cut, the client gets
+  a STATUS "Link too long to open outside the app" instead.
+- One data/download folder rule: `<app data>` = ASB_STATE, else `<data>/<app id>`, `<data>` = the Host's {state}
+  (--data-dir / data_dir, default ~/.local/share/amistudio-host), now passed to services as AMISTUDIO_HOST_DATA;
+  downloads in `<app data>/downloads` (ASB_DOWNLOADS overrides). Bundled amidiscord: `<data>/amidiscord/downloads`.
+  A service block without ASB_STATE (and AmiSurf's `browser` data) now follows --data-dir too. asb-chromed in app
+  mode without engine.sh no longer defaults to AmiKit's Downloads drawer.
+- Engine patch 0006 (patches 0001-0005 unchanged). docs/PROTOCOL.md "Details (0.1.5)". New tests in
+  test/app_tests.py (M3 logged-out unread, M4 short cancel/APPINFO/OPENURL limit, dlpath_tests).
+
+0.1.4 (2026-10-17) - AmiDiscord app mode
+- M0: a dropped client no longer locks a `max_clients` service: when the same client reconnects (same paired token,
+  or same client id from the same address on loopback) the Host closes its stale session and the new one gets OK
+  instead of status 5 (busy). Other clients still get busy. Also on the compat port. plat_shutdown() added (POSIX +
+  Windows). 7 new tests.
+- M0: the ASBC FRAME header is documented in docs/PROTOCOL.md, including the pixel-format byte (offset 13) of fmt 3
+  tiles; the same fix to AmiSurf's asbc.h comment is engine patch 0001.
+- M1: app mode for a new `amidiscord` service (AmiDiscord, replacing Matrix Chat): the bundled engine is mounted a
+  second time in app mode (env ASB_APP=amidiscord, discord.com/app, max_clients 1, log amidiscord.log); Chrome
+  stays up 30 min after the last AmiDiscord client (`amidiscord_idle`, --amidiscord-idle, 0 = never),
+  `bundled_amidiscord no` / --no-bundled-amidiscord turns it off. Engine patch 0002 (chrome/appmode.inc, all gated
+  on ASB_APP): start URL, host allowlist, external links/new windows cancelled in Chrome and sent as OPENURL
+  (op 48), allowlisted popups open in the page, fallback title; no tabs, asb:// pages, bookmarks, history,
+  suggestions, password manager or save/source/PDF; reduced motion (prefers-reduced-motion + frame throttling,
+  `CMD app reducedmotion 0|1`) - test animation 3.8 MB/5 s instead of 115 MB; Chrome muted (`--mute-audio`, no
+  audio sink) so only the Amiga's own notifications sound. engine.sh keeps app data in
+  ~/.local/share/amistudio-host/<app>. Tests: test/app_tests.py + test/app_page.py (local fake app) and the real
+  discord.com/login page (render only, private profile and ports, no login).
+- M2: per-service data. New exec placeholders `{state}` (the Host's data folder: ~/.local/share/amistudio-host,
+  %LOCALAPPDATA%\AmiStudio-Host, `data_dir` / --data-dir) and `{config}`; the bundled amidiscord service sets both
+  ASB_STATE={state}/amidiscord and ASB_CONFIG={state}/amidiscord/config, and engine.sh now honours a given
+  ASB_CONFIG. Graceful stop: the Host sends SIGTERM to the backend alone and waits `stop_timeout` (default 15 s,
+  amidiscord 20) before ending its process group (Windows unchanged). Engine patch 0003: in app mode asb-chromed
+  closes Chrome with Browser.close on SIGTERM and on its idle exit, so the Discord login persists; app-mode
+  defaults no longer fall back to AmiSurf's ~/.config/amisurf; `CMD app logout`. 9 new tests (fake login in
+  cookie + localStorage survives Host and engine restarts; logout clears it).
+- M3: notifications for AmiDiscord. Engine patch 0004 (chrome/appnotify.inc, app mode only): Notification API +
+  ServiceWorker showNotification shim on the allowlisted origins (no DOM scraping, no Runtime.enable), permission
+  granted up front, unread count/dot from the title pattern table and favicon badge, focus/visibility emulation
+  (`CMD app focus F V`; hidden = no frames but notifications continue; no client = unfocused + hidden),
+  `CMD app notifyact`. The real discord.com login page gets the shim (checked, not logged in). 23 new tests with a
+  local fake page (test/app_page.py /notify).
+- M4: the AmiDiscord client protocol, capability-gated (docs/PROTOCOL.md "App mode messages"; engine patch 0005,
+  chrome/appproto.inc): client -> Host CAPS 22, FOCUS 23, NOTIFYACT 24, FILEPUT 25; Host -> client NOTIFY 45,
+  NOTIFYCLOSE 46, UNREAD 47 (on change, max 2/s, latest one after CAPS/reconnect), OPENURL 48 (now only with its
+  cap; else STATUS), FILEREQ 49, FILEDONE 50 (uploads via the page's file chooser, 25 MB limit), DOWNLOAD 51
+  (exact Host path), APPINFO 52 (reply to CAPS, host caps 63). clipboard.writeText -> CLIP. Without CAPS, and
+  always in AmiSurf's `browser` service, nothing changes. 23 new tests.
+- Engine patches: the Host's changes to AmiSurf's asb-chromed live in engine-patches/ (git format-patch mails
+  against the pinned AmiSurf commit, for AmiSurf to `git am`); tools/fetch-engine.sh applies them, and
+  tools/engine-work.sh init|export|build is the work tree for editing them. AmiSurf's repo is not touched.
+
+0.1.3 (2026-10-17)
+- `amistudio-hostd status` no longer hangs when another program holds the port: 2 s connect/read timeout
+  (ASH_TIMEOUT_MS overrides) and a clear message - "nothing listening", "in use by a program that is not an
+  AmiStudio Host (no ASH answer within 2.0 s / it answered something else)". ashc_set_timeout() in the C client
+  (not on Amiga builds); `ash-cli info` uses 5 s. Reported by AmiSurf.
+- Host idle shutdown (`--exit-idle MIN`, host.conf `exit_idle`, run-host.sh `--host-idle` / `--idle`): the Host
+  stops after MIN minutes in which NO client connection was open and none was opened. Every ASH connection counts
+  (AmiSurf sessions, the launcher's hostinfo checks, pair, fetch) and so does the 9223 compat port; discovery
+  broadcasts do not. The engine idles on its own (`browser_idle`). Off by default (systemd). Reported by AmiSurf.
+- run-host.sh: `--idle MIN` now sets both the engine idle and the Host idle shutdown (the AmiKit behaviour);
+  `--engine-idle MIN` and `--host-idle MIN` set one each.
+- Browser data layout confirmed identical to AmiSurf's AmiKit Host/data: config/ and profile/ (and WidevineCdm/)
+  copy straight into ~/.local/share/amistudio-host/browser; tested.
+- Engine pin unchanged (bd10794; asb-chromed source identical since 4bb4f04).
+
+0.1.2 (2026-10-17)
+- The release tarball bundles AmiSurf's browser engine, so one Host install serves AmiSurf with no extra download:
+  engine/asb-chromed (static, built from AmiSurf 0.83 wip/083 bd10794) and engine/chromium/ (ungoogled-chromium
+  portablelinux 155.0.8059.79-1 x86_64, headless, unmodified; chromedriver removed) - the same engine AmiSurf 0.83's
+  AmiKit edition ships. Built with tools/fetch-engine.sh (pinned commit, Chromium sha256 checked); `make tarball`.
+- The bundled engine is mounted as the "browser" service automatically (ASBC v2 handshake, proto 2) when
+  INSTALLDIR/engine/engine.sh exists and host.conf has no browser service. host.conf `bundled_browser no` or
+  --no-bundled-browser turns it off; `browser_idle MIN` / --browser-idle MIN (default 30) stops an unused engine,
+  which the Host restarts on demand.
+- Browser data lives outside the install folder: ~/.local/share/amistudio-host/browser (config/ = bookmarks,
+  history, settings, passwords; profile/ = Chromium profile; ASB_STATE overrides). Engine log: CONFDIR/browser.log.
+- run-host.sh: --port, --idle MIN, --lan, --pair (print a pairing code), --background (detach; safe to run twice),
+  other options go to amistudio-hostd. Restores lost exec bits.
+- install-user.sh installs the whole folder to ~/.local/lib/amistudio-host (swapped in on update) and links
+  ~/.local/bin/amistudio-hostd to it, so the systemd user unit runs the bundled engine. Settings and data are kept.
+- New exec placeholder {port2}: a second free loopback port (the engine's private Chrome debug port).
+- LICENSES/: Chromium licence + credits, ungoogled-chromium and portablelinux licences, AmiSurf's attributions,
+  stb_image / QOI / OpenSSL / zlib / zstd notices, ENGINE-VERSION.txt.
+- Tests: 97 with ASH_TEST_BROWSER=1 and the tarball built (22 end-to-end on the unpacked tarball: page render,
+  data outside the install dir, reaper + restart, --pair, --background --lan, install-user.sh + systemd unit).
+
+0.1.1 (2026-10-17)
+- Backend reaper: a thread checks every child-process service (asb-chromed and co.) once a second, so a backend
+  that exits is reaped at once instead of staying a zombie until the next client connects. The exit (status or
+  signal) is logged, hostinfo shows "idle exited signal N" / "idle exited status N", and the next client starts
+  it again. "start boot" backends are restarted by the reaper itself (5 s back-off after a quick crash).
+  Reported by AmiSurf.
+- Re-pairing replaces the old token: a pair request from the same Amiga (same client id, or the same name from
+  the same address when no id is sent) drops that Amiga's previous token instead of adding a second entry. The
+  log names the replaced id. PAIR_REQ takes an optional third line, a stable client id. Reported by AmiSurf.
+- `amistudio-hostd tokens` shows when each token was last used (and the client id, if any). The tokens file
+  gains optional u=LAST_USED and c=CLIENT_ID fields (written at most once a minute per token); 0.1 files still
+  load. `revoke` unchanged.
+- The Host's own update check reads the "component host" block of the AmiStudio-Releases manifest (PC parts are
+  component blocks, which Amiga launchers skip); an "app host" block is still understood.
+- New platform call plat_proc_reap() (POSIX + Windows) returns how a backend exited.
+- Tests: 80 with ASH_TEST_BROWSER=1 (75 without), incl. the update check against a local manifest, reaper on a fake backend and on real asb-chromed,
+  boot-restart, re-pair by name and by client id, 0.1 tokens-file compatibility.
+
+0.1 (2026-10-17)
+- First version: ASH v1 on 9220, pairing + tokens + bans, LAN discovery, hostinfo, fetch proxy, child-process
+  service plugin (asb-chromed mounted unchanged, ASBC compat port), Windows layer (compile-checked), systemd unit.

@@ -1,0 +1,555 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: "Grok Bot (for Rich)" <hardcopi@users.noreply.github.com>
+Date: Sat, 17 Oct 2026 22:33:13 -0400
+Subject: [PATCH] App mode (ASB_APP): serve one web app such as AmiDiscord
+ instead of a browser
+
+New chrome/appmode.inc, off unless ASB_APP is set, so AmiSurf sessions are unchanged.
+- ASB_APP id, ASB_APP_URL start page (loaded at start, cmd app home), ASB_APP_TITLE fallback title,
+  ASB_APP_ALLOW host globs (default: Discord's hosts + hCaptcha), ASB_APP_EXTERNAL client|deny.
+- Top-level documents of the page are checked with Fetch (request stage) before they load; other hosts are
+  cancelled and sent to the client as the new ASBC_OPENURL (48, reason 0 link, 1 new window, 2 client NAV).
+- New windows (window.open, target=_blank): a second CDP connection to the browser endpoint auto-attaches to new
+  pages paused (waitForDebuggerOnStart), catches their first document request, closes them; allowlisted URLs open
+  in the app's own page, others go out as OPENURL. Nothing reaches the external site.
+- No tabs (TABNEW/TABSEL/TABCLS ignored, no TABS message), no asb:// pages server, no bookmarks/history/suggest,
+  no password manager (no probe/autofill/bar), no save page/source/PDF: only zoom, find, ctx, avdelay and
+  'app home|reducedmotion 0|1' commands. Client NAV only to allowlisted hosts.
+- Reduced motion (ASB_APP_REDUCEDMOTION, default on; cmd app reducedmotion 0|1): prefers-reduced-motion: reduce
+  emulated, plus frame throttling: at most one update per ASB_APP_SMALL_MS (100) and changes over a quarter of the
+  view at most once per ASB_APP_BIG_MS (1000); held frames are replaced and flushed, so the last state arrives.
+  ASB_APP_DARK=1 also emulates prefers-color-scheme: dark.
+- ASB_APP_MUTE (default 1): Chrome gets --mute-audio and no audio sink, so the app's own sounds never play.
+- spawn_chrome builds its argv as an array (same flags as before for AmiSurf).
+---
+ Makefile            |   4 +-
+ chrome/appmode.inc  | 222 ++++++++++++++++++++++++++++++++++++++++++++
+ chrome/asbc.h       |   4 +-
+ chrome/features.inc |   5 +-
+ chrome/host.c       |  55 +++++++----
+ 5 files changed, 270 insertions(+), 20 deletions(-)
+ create mode 100644 chrome/appmode.inc
+
+diff --git a/Makefile b/Makefile
+index 4576b05..4faf00d 100644
+--- a/Makefile
++++ b/Makefile
+@@ -23,7 +23,7 @@ amiga: $(AMIGA_BINS)
+ chrome-host: build/host/asb-chromed
+ sdl: build/host/asb-sdl
+ 
+-build/host/asb-chromed: chrome/host.c chrome/features.inc chrome/frames.inc chrome/bidi.inc chrome/audio.inc $(PROTO)
++build/host/asb-chromed: chrome/host.c chrome/features.inc chrome/frames.inc chrome/bidi.inc chrome/audio.inc chrome/appmode.inc $(PROTO)
+ 	@mkdir -p $(@D); $(HOSTCC) $(HOSTCFLAGS) -o $@ chrome/host.c chrome/asbc.c -lcrypto -lm
+ build/host/asb-sdl: ui/asb_sdl_chrome.c $(PROTO)
+ 	@mkdir -p $(@D); $(HOSTCC) $(HOSTCFLAGS) -I/usr/include/SDL2 -o $@ ui/asb_sdl_chrome.c chrome/asbc.c -lSDL2 -lSDL2_ttf -lm
+@@ -66,7 +66,7 @@ clean:
+ .PHONY: all host amiga chrome-host sdl test lha clean
+ 
+ # static asb-chromed (AmiKit bundle; also a portable engine for the AmiStudio Host's "browser" service)
+-build/static/asb-chromed: chrome/host.c chrome/features.inc chrome/frames.inc chrome/bidi.inc chrome/audio.inc $(PROTO)
++build/static/asb-chromed: chrome/host.c chrome/features.inc chrome/frames.inc chrome/bidi.inc chrome/audio.inc chrome/appmode.inc $(PROTO)
+ 	@mkdir -p $(@D); $(HOSTCC) -O2 -std=gnu99 -pthread -static -o $@ chrome/host.c chrome/asbc.c -lcrypto -lz -lzstd -lm 2>&1 | grep -v "warning: Using" || true; test -x $@
+ # 0.82: the own Linux host package (asb-chromed-<ver>-linux-x86_64.tar.gz, dist/host/) is retired; the AmiStudio Host
+ # runs asb-chromed (docs/HOST.md). The last one is asb-chromed-0.77-linux-x86_64.tar.gz.
+diff --git a/chrome/appmode.inc b/chrome/appmode.inc
+new file mode 100644
+index 0000000..3198e7e
+--- /dev/null
++++ b/chrome/appmode.inc
+@@ -0,0 +1,222 @@
++/* appmode.inc - app (kiosk) mode: asb-chromed serves ONE web app instead of a browser, e.g. AmiDiscord
++   (ASB_APP=amidiscord, https://discord.com/app). Included by host.c after audio.inc. Nothing here runs unless
++   ASB_APP is set, so AmiSurf's own sessions behave exactly as before.
++
++   Environment (set by the AmiStudio Host's service block):
++     ASB_APP            app id; turns app mode on
++     ASB_APP_URL        start URL (loaded at start and on "cmd app home")
++     ASB_APP_ALLOW      comma/space list of host globs that may load in the page ("*.discord.com", "discord.gg",
++                        "127.0.0.1:8080" with a port); everything else is external
++     ASB_APP_EXTERNAL   client (default): external links are cancelled and sent to the client as OPENURL;
++                        deny: just cancelled
++     ASB_APP_TITLE      title sent in META until the page has one
++     ASB_APP_REDUCEDMOTION  1 (default) or 0: prefers-reduced-motion + frame throttling (cmd app reducedmotion 0|1)
++     ASB_APP_SMALL_MS / ASB_APP_BIG_MS  throttle: at most one update per SMALL_MS (default 100), and changes that
++                        cover more than a quarter of the view at most once per BIG_MS (default 1000)
++     ASB_APP_DARK       1: also emulate prefers-color-scheme: dark
++     ASB_APP_MUTE       1 (default): Chrome runs with --mute-audio, so the app's own sounds never play (the client
++                        plays its own notification sounds)
++   In app mode there are no tabs, no asb:// pages, no bookmarks/history/suggestions, no password manager and no
++   save page/source/PDF. Client NAV is accepted for allowlisted hosts only. */
++
++static char g_app_id[64], g_app_url[1200], g_app_title[128];
++#define APP_MAXALLOW 48
++static char g_app_allow[APP_MAXALLOW][128]; static int g_app_nallow;
++static int g_app_ext;                     /* 0 client (OPENURL), 1 deny */
++static int g_rm=1, g_rm_small_ms=100, g_rm_big_ms=1000, g_app_dark, g_app_mute=1;
++static int g_app_fetch_on;                /* Fetch.enable done on this tab */
++static void app_bws_open(void);
++
++static const char *APP_DEFAULT_ALLOW="discord.com,*.discord.com,discordapp.com,*.discordapp.com,*.discordapp.net,"
++  "discord.gg,*.discord.gg,discord.new,*.hcaptcha.com,hcaptcha.com";
++
++static int env_int(const char *n,int def){ const char *v=getenv(n); return v&&v[0]?atoi(v):def; }
++static void app_init(void){
++  const char *a=getenv("ASB_APP"); if(!a||!a[0]) return;
++  g_app=1; scopy(g_app_id,sizeof g_app_id,a);
++  const char *u=getenv("ASB_APP_URL"); scopy(g_app_url,sizeof g_app_url,u&&u[0]?u:"https://discord.com/app");
++  const char *t=getenv("ASB_APP_TITLE"); scopy(g_app_title,sizeof g_app_title,t&&t[0]?t:a);
++  const char *x=getenv("ASB_APP_EXTERNAL"); g_app_ext=x&&!strcasecmp(x,"deny");
++  const char *al=getenv("ASB_APP_ALLOW"); if(!al||!al[0]) al=APP_DEFAULT_ALLOW;
++  char tmp[4096]; scopy(tmp,sizeof tmp,al);
++  for(char *s=strtok(tmp,", \t");s && g_app_nallow<APP_MAXALLOW;s=strtok(NULL,", \t")){
++    for(char *q=s;*q;q++) *q=(char)tolower((unsigned char)*q);
++    scopy(g_app_allow[g_app_nallow++],sizeof g_app_allow[0],s); }
++  g_rm=env_int("ASB_APP_REDUCEDMOTION",1)!=0;
++  g_rm_small_ms=env_int("ASB_APP_SMALL_MS",100); g_rm_big_ms=env_int("ASB_APP_BIG_MS",1000);
++  g_app_dark=env_int("ASB_APP_DARK",0)!=0; g_app_mute=env_int("ASB_APP_MUTE",1)!=0;
++  scopy(g_title,sizeof g_title,g_app_title);
++  fprintf(stderr,"asb-chromed: app mode '%s': %s, %d allowed host patterns, external links %s, reduced motion %s%s\n",
++    g_app_id,g_app_url,g_app_nallow,g_app_ext?"denied":"to the client",g_rm?"on":"off",g_app_mute?", muted":""); }
++
++/* "https://user@Host.Example:443/x" -> host "host.example", port 443 (0 if none); returns 0 if not http(s) */
++static int url_host(const char *url,char *host,int cap,int *port){
++  const char *p; *port=0; host[0]=0;
++  if(!strncasecmp(url,"https://",8)) p=url+8; else if(!strncasecmp(url,"http://",7)) p=url+7; else return 0;
++  const char *e=p+strcspn(p,"/?#"); const char *at=memchr(p,'@',(size_t)(e-p)); if(at) p=at+1;
++  int n=0; for(;p<e && *p!=':' && n<cap-1;p++) host[n++]=(char)tolower((unsigned char)*p); host[n]=0;
++  if(p<e && *p==':') *port=atoi(p+1);
++  return n>0; }
++static int glob_host(const char *pat,const char *host){
++  if(pat[0]=='*' && pat[1]=='.'){ size_t pl=strlen(pat+1), hl=strlen(host);   /* "*.x.com": any subdomain of x.com */
++    return hl>pl && !strcmp(host+hl-pl,pat+1); }
++  return !strcmp(pat,host); }
++static int app_url_ok(const char *url){
++  if(!strcmp(url,"about:blank")) return 1;
++  char h[256]; int port; if(!url_host(url,h,sizeof h,&port)) return 0;
++  char hp[280]; snprintf(hp,sizeof hp,"%s:%d",h,port);
++  for(int i=0;i<g_app_nallow;i++){ const char *pat=g_app_allow[i];
++    if(strchr(pat,':')){ if(port && glob_host(pat,hp)) return 1; } else if(glob_host(pat,h)) return 1; }
++  return 0; }
++
++static void put_str16(unsigned char *b,int *o,int cap,const char *s){
++  unsigned n=(unsigned)strlen(s); if((int)n>cap-*o-2) n=(unsigned)(cap-*o-2); if((int)n<0) n=0;
++  asbc_put_u16(b+*o,n); *o+=2; memcpy(b+*o,s,n); *o+=(int)n; }
++/* an external link: reason 0 link/navigation, 1 new window, 2 typed by the client */
++static void app_openurl(const char *url,int reason){
++  fprintf(stderr,"asb-chromed: app: external %s %.200s\n",reason==1?"window":reason==2?"address from the client":"link",url);
++  if(g_app_ext || g_cli<0) return;
++  unsigned char b[2600]; int o=0; put_str16(b,&o,(int)sizeof b-1,url); b[o++]=(unsigned char)reason;
++  asbc_send(g_cli,ASBC_OPENURL,b,(uint32_t)o); }
++
++/* ---- per tab: emulation + navigation guard ---- */
++static void app_media(void){
++  int i=cdp_id();
++  cdp("{\"id\":%d,\"method\":\"Emulation.setEmulatedMedia\",\"params\":{\"features\":[{\"name\":\"prefers-reduced-motion\",\"value\":\"%s\"}%s]}}",
++      i,g_rm?"reduce":"",g_app_dark?",{\"name\":\"prefers-color-scheme\",\"value\":\"dark\"}":""); }
++static void app_enable(void){
++  if(!g_app || g_bidi) return;
++  app_media();
++  /* top-level documents are checked before they load (Fetch, request stage, documents only) */
++  int i=cdp_id(); cdp("{\"id\":%d,\"method\":\"Fetch.enable\",\"params\":{\"patterns\":[{\"urlPattern\":\"*\",\"resourceType\":\"Document\",\"requestStage\":\"Request\"}]}}",i);
++  g_app_fetch_on=1;
++  app_bws_open(); }
++
++/* ---- new windows: window.open / target=_blank ----
++   A second CDP connection to the browser endpoint auto-attaches to every new page with waitForDebuggerOnStart, so
++   a popup is paused before it loads anything. Its first document request is caught with Fetch in the popup's own
++   session: the window is closed again, never having contacted the site, and the URL opens in the app's page
++   (allowlisted host) or goes to the client as OPENURL. */
++static int g_bws=-1; static long long g_bws_retry;
++static struct { char sid[80], tid[80]; long long t; } g_pop[8]; static int g_npop;
++static int bcdp(const char *fmt,...){
++  static char cmd[4000]; va_list ap; va_start(ap,fmt); vsnprintf(cmd,sizeof cmd,fmt,ap); va_end(ap);
++  return g_bws>=0?ws_send_text(g_bws,cmd):-1; }
++static const char *main_target(void){ return (g_tab>=0 && g_tab<g_ntab)?g_tabs[g_tab].id:""; }
++static void app_bws_open(void){
++  if(!g_app || g_bidi || g_bws>=0) return;
++  buf_t r={0}; char u[400]="";
++  if(!http_get(g_dbg,"/json/version",&r) && r.p) json_str(r.p,"webSocketDebuggerUrl",u,sizeof u);
++  free(r.p);
++  if(!u[0] || (g_bws=ws_open(u))<0){ g_bws=-1; fprintf(stderr,"asb-chromed: app: browser endpoint not reachable, new windows are not caught\n"); return; }
++  bcdp("{\"id\":%d,\"method\":\"Target.setAutoAttach\",\"params\":{\"autoAttach\":true,\"waitForDebuggerOnStart\":true,\"flatten\":true,\"filter\":[{\"type\":\"page\",\"exclude\":false}]}}",cdp_id()); }
++static void app_bws_close(void){ if(g_bws>=0){ close(g_bws); g_bws=-1; } g_npop=0; }
++static void pop_drop(int k){ g_pop[k]=g_pop[--g_npop]; }
++static void app_bws_msg(const char *msg){
++  char method[80]=""; json_str(msg,"method",method,sizeof method);
++  if(!strcmp(method,"Target.attachedToTarget")){
++    char sid[80]="", tid[80]=""; json_str(msg,"sessionId",sid,sizeof sid); json_str(msg,"targetId",tid,sizeof tid);
++    if(strstr(msg,"\"openerId\"") && strcmp(tid,main_target()) && g_npop<8){   /* a window the page opened */
++      scopy(g_pop[g_npop].sid,sizeof g_pop[0].sid,sid); scopy(g_pop[g_npop].tid,sizeof g_pop[0].tid,tid); g_pop[g_npop].t=now_ms(); g_npop++;
++      bcdp("{\"id\":%d,\"sessionId\":\"%s\",\"method\":\"Fetch.enable\",\"params\":{\"patterns\":[{\"urlPattern\":\"*\",\"resourceType\":\"Document\",\"requestStage\":\"Request\"}]}}",cdp_id(),sid); }
++    bcdp("{\"id\":%d,\"sessionId\":\"%s\",\"method\":\"Runtime.runIfWaitingForDebugger\"}",cdp_id(),sid);
++    return; }
++  if(!strcmp(method,"Fetch.requestPaused")){
++    char sid[80]="", rid[120]="", url[2400]="";
++    { const char *q=NULL, *f=msg; while((f=strstr(f,"\"sessionId\":\""))){ q=f; f++; } if(q) json_str(q,"sessionId",sid,sizeof sid); }   /* the top-level (last) one */
++    json_str(msg,"requestId",rid,sizeof rid); { const char *r=strstr(msg,"\"request\""); json_str(r?r:msg,"url",url,sizeof url); }
++    bcdp("{\"id\":%d,\"sessionId\":\"%s\",\"method\":\"Fetch.failRequest\",\"params\":{\"requestId\":\"%s\",\"errorReason\":\"Aborted\"}}",cdp_id(),sid,rid);
++    for(int k=0;k<g_npop;k++) if(!strcmp(g_pop[k].sid,sid)){
++      bcdp("{\"id\":%d,\"method\":\"Target.closeTarget\",\"params\":{\"targetId\":\"%s\"}}",cdp_id(),g_pop[k].tid); pop_drop(k);
++      if(app_url_ok(url)){ fprintf(stderr,"asb-chromed: app: new window for %.200s opened in the page instead\n",url); cdp_nav(url); }
++      else app_openurl(url,1);
++      break; }
++    return; }
++  if(!strcmp(method,"Target.detachedFromTarget")){ char sid[80]=""; json_str(msg,"sessionId",sid,sizeof sid);
++    for(int k=0;k<g_npop;k++) if(!strcmp(g_pop[k].sid,sid)){ pop_drop(k); break; } } }
++
++/* ---- reduced motion: frame throttling ----
++   Animated pages (Discord's login background) otherwise resend near-full frames several times a second: 2.2 MB
++   each at 1024x720 RGB24. Updates come at most every SMALL_MS; large ones (> 1/4 of the view changed) at most every
++   BIG_MS. A held frame is replaced by newer ones and goes out when it is due, so the last state always arrives. */
++static unsigned char *g_hold; static int g_hold_w, g_hold_h; static long long g_last_upd, g_last_big;
++static long dirty_area(const unsigned char *rgb,int iw,int ih){
++  if(!g_prev || g_prev_w!=iw || g_prev_h!=ih) return (long)iw*ih;
++  int st=iw*3, minx=iw, maxx=-1, miny=-1, maxy=-1;
++  for(int y=0;y<ih;y++){ const unsigned char *a=rgb+(long)y*st, *b=g_prev+(long)y*st;
++    if(!memcmp(a,b,(size_t)st)) continue;
++    if(miny<0) miny=y; maxy=y;
++    int x0=0; while(x0<iw && !memcmp(a+x0*3,b+x0*3,3)) x0++;
++    int x1=iw-1; while(x1>x0 && !memcmp(a+x1*3,b+x1*3,3)) x1--;
++    if(x0<minx) minx=x0; if(x1>maxx) maxx=x1; }
++  return maxx<0?0:(long)(maxx-minx+1)*(maxy-miny+1); }
++static void frame_rgb(unsigned char *rgb,int iw,int ih,int n);
++/* returns 1 if the frame was kept for later (the caller must not use rgb any more) */
++static int app_hold(unsigned char *rgb,int iw,int ih){
++  if(!g_app || !g_rm) return 0;
++  long long t=now_ms(); long a=dirty_area(rgb,iw,ih);
++  if(!a){ free(rgb); return 1; }                                   /* nothing changed */
++  int big=a*4>(long)iw*ih;
++  if(t-g_last_upd>=g_rm_small_ms && (!big || t-g_last_big>=g_rm_big_ms) && !g_hold){
++    g_last_upd=t; if(big) g_last_big=t; return 0; }
++  free(g_hold); g_hold=rgb; g_hold_w=iw; g_hold_h=ih; return 1; }
++static void app_hold_flush(void){
++  if(!g_hold) return;
++  if(g_cli<0 || !g_screencast_on){ free(g_hold); g_hold=NULL; return; }
++  long long t=now_ms(); if(t-g_last_upd<g_rm_small_ms) return;
++  long a=dirty_area(g_hold,g_hold_w,g_hold_h); int big=a*4>(long)g_hold_w*g_hold_h;
++  if(big && t-g_last_big<g_rm_big_ms) return;
++  unsigned char *r=g_hold; g_hold=NULL; g_last_upd=t; if(big) g_last_big=t;
++  if(!a){ free(r); return; }
++  frame_rgb(r,g_hold_w,g_hold_h,0); }
++static void app_set_rm(int on){
++  g_rm=on!=0; if(!g_rm && g_hold){ unsigned char *r=g_hold; g_hold=NULL; frame_rgb(r,g_hold_w,g_hold_h,0); }
++  app_media(); fprintf(stderr,"asb-chromed: app: reduced motion %s\n",g_rm?"on":"off");
++  send_status(g_rm?"Reduced motion on":"Reduced motion off"); }
++
++/* ---- client commands in app mode: "app home|reducedmotion 0|1", zoom, find, ctx, avdelay; the rest is ignored ---- */
++static int app_cmd(char *c,char *arg){
++  if(!g_app) return 0;
++  if(!strcmp(c,"zoom")||!strcmp(c,"findnext")||!strcmp(c,"findprev")||!strcmp(c,"findclose")||!strcmp(c,"ctx")||!strcmp(c,"avdelay")) return 0;
++  if(!strcmp(c,"home")){ cdp_nav(g_app_url); return 1; }
++  if(!strcmp(c,"app")){
++    char *v=strchr(arg,' '); if(v) *v++=0; else v="";
++    if(!strcmp(arg,"home")) cdp_nav(g_app_url);
++    else if(!strcmp(arg,"reducedmotion")) app_set_rm(atoi(v));
++    else fprintf(stderr,"asb-chromed: app: unknown command app %s\n",arg);
++    return 1; }
++  fprintf(stderr,"asb-chromed: app mode: cmd %s ignored\n",c); return 1; }
++/* client NAV in app mode: allowlisted hosts only */
++static int app_nav(const char *u){
++  if(!g_app) return 0;
++  if(app_url_ok(u)) cdp_nav(u);
++  else { fprintf(stderr,"asb-chromed: app: NAV to %.200s refused (not on ASB_APP_ALLOW)\n",u); send_status("That address does not open here"); app_openurl(u,2); }
++  return 1; }
++
++/* CDP events/replies for app mode; returns 1 if consumed */
++static int app_event(const char *method,const char *msg){
++  if(!g_app) return 0;
++  if(!strcmp(method,"Fetch.requestPaused")){
++    char rid[120]="", fid[80]="", url[2400]=""; json_str(msg,"requestId",rid,sizeof rid); json_str(msg,"frameId",fid,sizeof fid);
++    { const char *r=strstr(msg,"\"request\""); json_str(r?r:msg,"url",url,sizeof url); }
++    int i=cdp_id();
++    if(!strcmp(fid,main_target()) && !app_url_ok(url)){
++      cdp("{\"id\":%d,\"method\":\"Fetch.failRequest\",\"params\":{\"requestId\":\"%s\",\"errorReason\":\"Aborted\"}}",i,rid);
++      app_openurl(url,0); }
++    else cdp("{\"id\":%d,\"method\":\"Fetch.continueRequest\",\"params\":{\"requestId\":\"%s\"}}",i,rid);
++    return 1; }
++  return 0; }
++
++/* every main-loop pass (20 ms) */
++static void app_tick(void){
++  if(!g_app) return;
++  app_hold_flush();
++  long long t=now_ms();
++  for(int k=0;k<g_npop;k++) if(t-g_pop[k].t>8000){ fprintf(stderr,"asb-chromed: app: empty new window closed\n");
++    bcdp("{\"id\":%d,\"method\":\"Target.closeTarget\",\"params\":{\"targetId\":\"%s\"}}",cdp_id(),g_pop[k].tid); pop_drop(k); k--; }
++  if(g_bws<0 && g_ws>=0 && !g_bidi && t>g_bws_retry){ g_bws_retry=t+5000; app_bws_open(); } }
++/* the browser endpoint's messages (select loop in host.c) */
++static void app_bws_read(void){
++  static buf_t b; int k=ws_recv(g_bws,&b);
++  if(k<0){ fprintf(stderr,"asb-chromed: app: browser endpoint closed\n"); app_bws_close(); return; }
++  if(k>0 && b.n) app_bws_msg(b.p); }
+diff --git a/chrome/asbc.h b/chrome/asbc.h
+index 2f90e61..25cdbdb 100644
+--- a/chrome/asbc.h
++++ b/chrome/asbc.h
+@@ -53,7 +53,9 @@ enum {
+   ASBC_AUDIO  = 44, /* u8 fmt (ASBC_AU_*), u8 channels, u16 rate, u32 host ms timestamp, u16 nframes, data */
+   ASBC_BMARKS = 45, /* 0.87, host -> client: utf-8 lines "url\ttitle\tfolder" (bookmarks.tsv order); sent after the
+                        client's "bookmarks" cmd and again whenever the list changes. Older clients never ask. */
+-  ASBC_SCROLL = 43  /* u16 x,y,w,h, i16 dy: move that page area by dy (content moves up when dy<0) */
++  ASBC_SCROLL = 43, /* u16 x,y,w,h, i16 dy: move that page area by dy (content moves up when dy<0) */
++  /* app mode (ASB_APP, appmode.inc); AmiSurf sessions never get these */
++  ASBC_OPENURL= 48  /* u16 n, url, u8 reason (0 link, 1 new window, 2 client NAV not allowed): open it outside the app */
+ };
+ 
+ /* FRAME fmt 3 payload (after the 12 header bytes and fmt=3): u8 pixfmt (ASBC_PF_*, the format announced with ASBC_FMT),
+diff --git a/chrome/features.inc b/chrome/features.inc
+index 351c733..45b0ec4 100644
+--- a/chrome/features.inc
++++ b/chrome/features.inc
+@@ -211,7 +211,7 @@ static void origin_of(const char *url,char *o,int cap){
+   const char *s=strchr(p+3,'/'); int n=s?(int)(s-url):(int)strlen(url); if(n>=cap) n=cap-1;
+   memcpy(o,url,(size_t)n); o[n]=0; }
+ static void pw_bar(void){
+-  if(!g_pend_o[0]) return;
++  if(!g_pend_o[0] || g_app) return;
+   char eo[700], eu[500]; jesc(g_pend_o,eo,sizeof eo); jesc(g_pend_u[0]?g_pend_u:"(no user name)",eu,sizeof eu);
+   int i=cdp_id();
+   cdp("{\"id\":%d,\"method\":\"Runtime.evaluate\",\"params\":{\"expression\":\"(function(){var o=document.getElementById('asbpwbar');if(o)o.remove();"
+@@ -243,6 +243,7 @@ static void pw_probe(int x,int y,int k){
+       "for(var m=0;m<s.length;m++){if(s[m]===p)break;var t=(s[m].type||'text').toLowerCase();if((t=='text'||t=='email'||t=='tel')&&s[m].value)u=s[m]}"
+       "return JSON.stringify({o:doc.defaultView.location.origin,u:u?u.value:'',p:p.value})}catch(z){return ''}})(%d,%d,%d)\",\"returnByValue\":true}}",i,x,y,k); }
+ static void pw_autofill(void){
++  if(g_app) return;   /* app mode: no password manager (the app's logins never go into AmiSurf's store) */
+   char o[300]; origin_of(g_url,o,sizeof o); if(!o[0]) return;
+   char *db=pw_load(); if(!db) return;
+   char u[200], p[200]; int never;
+@@ -491,6 +492,7 @@ static void ban_fail(uint32_t ip){
+ static void do_cmd(char *c){
+   char *arg=strchr(c,' '); if(arg) *arg++=0; else arg="";
+   int i;
++  if(app_cmd(c,arg)) return;   /* app mode: only zoom/find/ctx/avdelay and "app ..." */
+   if(!strcmp(c,"zoom")){ if(!strcmp(arg,"+")) set_zoom(zoom_step(1)); else if(!strcmp(arg,"-")) set_zoom(zoom_step(-1)); else if(!strcmp(arg,"0")) set_zoom(100); else set_zoom(atoi(arg)); }
+   else if(!strcmp(c,"findnext")) find_run(1,0);
+   else if(!strcmp(c,"findprev")) find_run(-1,0);
+@@ -599,6 +601,7 @@ static void feat_init(int asbcport){
+   unsigned char r[16]; if(RAND_bytes(r,16)!=1){ for(int i=0;i<16;i++) r[i]=(unsigned char)rng32(); }
+   for(int i=0;i<16;i++) snprintf(g_pagekey+i*2,3,"%02x",r[i]);
+   g_pageport=asbcport+1;
++  if(g_app){ fprintf(stderr,"asb-chromed: app mode: no asb:// pages, config %s\n",g_cfg); return; }
+   g_pagefd=tcp_listen_local(g_pageport,"127.0.0.1"); /* always loopback: only Chrome on this host opens these pages */
+   if(g_pagefd<0) fprintf(stderr,"asb-chromed: pages port %d busy; asb:// pages disabled\n",g_pageport);
+   else fprintf(stderr,"asb-chromed: pages on 127.0.0.1:%d, config %s\n",g_pageport,g_cfg); }
+diff --git a/chrome/host.c b/chrome/host.c
+index f48cea9..49d905a 100644
+--- a/chrome/host.c
++++ b/chrome/host.c
+@@ -51,6 +51,10 @@ static int g_zoom; static char g_order[MAXTAB][80]; static int g_norder;
+ static void hist_note(void); static void display_url(const char *in,char *out,int cap); static void feat_enable(void);
+ static int g_bidi; static char g_ctx[80]; /* Firefox backend (bidi.inc) */
+ static void bidi_from_cdp(const char *cmd); static int bidi_tree(void); static int bidi_tab_create(const char *url); static void bidi_tab_close(const char *ctx);
++/* app mode (appmode.inc, ASB_APP): off for AmiSurf */
++static int g_app; static void app_enable(void); static int app_cmd(char *c,char *arg); static int app_nav(const char *u);
++static int app_event(const char *method,const char *msg); static int app_hold(unsigned char *rgb,int iw,int ih);
++static void app_tick(void); static void app_init(void); static void app_bws_read(void); static void app_bws_close(void);
+ 
+ /* ---- growable buffer ---- */
+ typedef struct { char *p; int n, cap; } buf_t;
+@@ -270,6 +274,7 @@ static void cdp_enable(void){
+   /* navigator.webdriver: --disable-blink-features=AutomationControlled already makes it a plain false. The old JS
+      override (own getter returning undefined) was itself a give-away, so it is gone. */
+   feat_enable();
++  app_enable();
+ }
+ static void cdp_viewport(int w, int h){
+   if(w<200) w=200; if(h<200) h=200; if(w>3840) w=3840; if(h>2160) h=2160;
+@@ -308,7 +313,7 @@ static void send_meta(void){
+   if(g_cli<0) return;
+   unsigned char b[2800]; int o=1;
+   b[0]=(unsigned char)((1/*back*/)|(2/*fwd*/)|(g_loading?4:0)); /* Chrome owns history */
+-  hist_note();
++  if(!g_app) hist_note();
+   char du[2400]; display_url(g_url,du,sizeof du);
+   unsigned ul=(unsigned)strlen(du), tl=(unsigned)strlen(g_title);
+   if(ul>2400) ul=2400; if(tl>250) tl=250;
+@@ -321,7 +326,7 @@ static void send_status(const char *s){
+   asbc_send(g_cli,ASBC_STATUS,s,(uint32_t)strlen(s));
+ }
+ static void send_tabs(void){
+-  if(g_cli<0) return;
++  if(g_cli<0 || g_app) return;   /* app mode: no tabs */
+   unsigned char b[2000]; int o=0, i;
+   b[o++]=(unsigned char)g_ntab;
+   b[o++]=(unsigned char)g_tab;
+@@ -500,13 +505,17 @@ static void send_update(unsigned char *rgb,int iw,int ih,int n){
+       free(g_prev); g_prev=rgb; g_prev_w=iw; g_prev_h=ih;
+ }
+ /* flow control: with ASBC_FF_ACK at most 2 updates are in flight; newer frames replace the waiting one (frame skip) */
++static void frame_rgb(unsigned char *rgb,int iw,int ih,int n){
++  if((g_ff&ASBC_FF_ACK) && g_inflight>=2){ free(g_pend); g_pend=rgb; g_pend_w=iw; g_pend_h=ih; g_pend_cap=g_cap_ms; g_skipped++; return; }
++  send_update(rgb,iw,ih,n);
++}
+ static void frame_png(int n){
+   if(n<=0 || g_cli<0) return;
+   int iw,ih,comp;
+   unsigned char *rgb=stbi_load_from_memory(g_cap,n,&iw,&ih,&comp,3);
+   if(!rgb || iw<1 || ih<1){ free(rgb); return; }
+-  if((g_ff&ASBC_FF_ACK) && g_inflight>=2){ free(g_pend); g_pend=rgb; g_pend_w=iw; g_pend_h=ih; g_pend_cap=g_cap_ms; g_skipped++; return; }
+-  send_update(rgb,iw,ih,n);
++  if(g_app && app_hold(rgb,iw,ih)) return;   /* app mode, reduced motion: frame throttling */
++  frame_rgb(rgb,iw,ih,n);
+ }
+ static void on_ack(void){
+   if(g_inflight>0) g_inflight--;
+@@ -543,6 +552,7 @@ static void on_cdp(const char *msg){
+   char method[80]; if(!json_str(msg,"method",method,sizeof method)) method[0]=0;
+   if(!method[0] && g_kick_id && json_int(msg,"id",-1)==g_kick_id){ g_kick_id=0;
+     int n=json_b64_field(msg,"data",g_cap,(int)sizeof g_cap); if(n>0 && g_frames_seen==g_kick_seen){ free(g_prev); g_prev=NULL; frame_png(n); } return; }
++  if(g_app && app_event(method,msg)) return;
+   if(!method[0] && feat_reply(msg)) return;
+   if(method[0] && feat_event(method,msg)) return;
+   if(!strcmp(method,"Page.screencastFrame")){
+@@ -625,6 +635,7 @@ static void on_cdp(const char *msg){
+ 
+ /* ---- 0.85: browser-target connection: downloads and tabs Chrome opens or closes by itself ---- */
+ static void bcon_open(void){
++  if(g_app) return;   /* see bcon_tick */
+   buf_t r={0}; char u[400]="";
+   if(http_get(g_dbg,"/json/version",&r)==0 && r.p) json_str(r.p,"webSocketDebuggerUrl",u,sizeof u);
+   free(r.p);
+@@ -664,7 +675,10 @@ static void on_bcon(const char *msg){
+       long long d=now_ms()+(strcmp(method,"Target.targetInfoChanged")?250:1000);
+       if(!g_tabs_due || d<g_tabs_due) g_tabs_due=d; } } }
+ static void bcon_tick(void){
+-  if(g_bidi || !g_chrome) return;
++  /* Host app mode (ASB_APP): never. App mode has one page and no tabs; this connection would pull the app's popups
++     in as tabs and re-set downloads to "allow" over the app's own browser connection (g_bws: autoAttach for popups,
++     allowAndName for download naming) */
++  if(g_app || g_bidi || !g_chrome) return;
+   long long t=now_ms();
+   if(g_bcon<0 && t-g_bcon_try>3000){ g_bcon_try=t; bcon_open(); }
+   /* no browser connection (old Chrome): look at the tab list every 2 s instead */
+@@ -672,6 +686,7 @@ static void bcon_tick(void){
+   if(g_tabs_due && t>=g_tabs_due && g_cli>=0){ g_tabs_due=0; tabs_resync(); } }
+ #include "bidi.inc"
+ #include "audio.inc"
++#include "appmode.inc"
+ 
+ static int g_mx, g_my;
+ static int browser_switch(int want);
+@@ -679,7 +694,7 @@ static void on_client(int op, unsigned char *p, int n){
+   if(op!=ASBC_MOUSE) fprintf(stderr,"asb-chromed: op %d n=%d\n",op,n);
+   switch(op){
+   case ASBC_HELLO:
+-    if(n>=5 && p[4] && p[4]!=(g_bidi?2:1)){ g_vw=asbc_get_u16(p); g_vh=asbc_get_u16(p+2); browser_switch(p[4]); } /* BROWSER= from the client */
++    if(n>=5 && p[4] && p[4]!=(g_bidi?2:1) && !g_app){ g_vw=asbc_get_u16(p); g_vh=asbc_get_u16(p+2); browser_switch(p[4]); } /* BROWSER= from the client */
+     g_au_caps=n>=6?p[5]:0; if(g_au_caps) audio_start_cap(); else audio_stop_cap();
+     if(n>=4){ cdp_viewport(asbc_get_u16(p), asbc_get_u16(p+2)); cdp_screencast(1); send_meta(); load_tabs(); send_tabs(); send_zoom(); kick_arm(); }
+     break;
+@@ -692,6 +707,7 @@ static void on_client(int op, unsigned char *p, int n){
+   case ASBC_NAV:{
+     char u[2400]; int m=n<(int)sizeof u-1?n:(int)sizeof u-1; memcpy(u,p,(size_t)m); u[m]=0;
+     if(!u[0]) break;
++    if(app_nav(u)){ send_meta(); break; }
+     { char r[2600]; if(nav_rewrite(u,r,sizeof r)) scopy(u,sizeof u,r); }
+     cdp_nav(u); send_meta();
+     break; }
+@@ -710,13 +726,15 @@ static void on_client(int op, unsigned char *p, int n){
+     fprintf(stderr,"asb-chromed: cmd %.80s\n",c);
+     do_cmd(c);
+     break; }
+-  case ASBC_TABNEW: tab_new(NULL); break;
++  case ASBC_TABNEW: if(!g_app) tab_new(NULL); break;
+   case ASBC_TABSEL:{
++    if(g_app) break;
+     int idx=n?p[0]:0;
+     load_tabs();
+     attach_tab(idx);
+     break; }
+   case ASBC_TABCLS:{
++    if(g_app) break;
+     int idx=n?p[0]:g_tab;
+     load_tabs();
+     if(idx>=0 && idx<g_ntab && g_tabs[idx].id[0]){
+@@ -765,7 +783,7 @@ static void on_client(int op, unsigned char *p, int n){
+     int which=btn&1?1:btn&2?2:btn&4?4: (ty==ASBC_MUP?1:0);
+     const char *button=which==1?"left":which==2?"right":which==4?"middle":"none";
+     int buttons=ty==ASBC_MUP?0:which;
+-    if(ty==ASBC_MDOWN && which==1) pw_probe(x,y,1); /* save-password bar buttons, login form submit (before the click) */
++    if(ty==ASBC_MDOWN && which==1 && !g_app) pw_probe(x,y,1); /* save-password bar buttons, login form submit (before the click) */
+     int i=cdp_id();
+     cdp("{\"id\":%d,\"method\":\"Input.dispatchMouseEvent\",\"params\":{\"type\":\"%s\",\"x\":%d,\"y\":%d,\"button\":\"%s\",\"buttons\":%d,\"clickCount\":%d}}",
+         i,type,x,y,button,buttons,(ty==ASBC_MDOWN||ty==ASBC_MUP)?1:0);
+@@ -809,7 +827,7 @@ static void on_client(int op, unsigned char *p, int n){
+     else if(vk==40){ snprintf(key,sizeof key,"ArrowDown"); snprintf(code,sizeof code,"ArrowDown"); }
+     else if(vk==46){ snprintf(key,sizeof key,"Delete"); snprintf(code,sizeof code,"Delete"); }
+     if(vk==13 && !esc[0]){ esc[0]='\r'; esc[1]=0; }
+-    if(vk==13 && ty==ASBC_KDOWN) pw_probe(0,0,2); /* Enter in a login form */
++    if(vk==13 && ty==ASBC_KDOWN && !g_app) pw_probe(0,0,2); /* Enter in a login form */
+     int i=cdp_id();
+     cdp("{\"id\":%d,\"method\":\"Input.dispatchKeyEvent\",\"params\":{\"type\":\"%s\",\"windowsVirtualKeyCode\":%d,\"nativeVirtualKeyCode\":%d,\"modifiers\":%d,\"key\":\"%s\",\"code\":\"%s\"%s%s%s}}",
+         i,type,vk,vk,mods,key,code,esc[0]?",\"text\":\"":"",esc,esc[0]?"\"":"");
+@@ -915,17 +933,18 @@ static int spawn_chrome(const char *profile, int dbgport){
+   if(pid<0) return -1;
+   if(pid==0){
+     int n=open("/dev/null",O_RDWR); if(n>=0){ dup2(n,0); dup2(n,1); }
+-    execl(bin,bin,
+-      portf, udir, sizef,
++    const char *av[32]={bin, portf, udir, sizef,
+       "--window-position=0,0",
+       "--remote-allow-origins=*",
+       "--disable-blink-features=AutomationControlled",
+       "--exclude-switches=enable-automation",
+       "--no-first-run","--no-default-browser-check","--disable-sync",
+       "--autoplay-policy=no-user-gesture-required",
+-      dldir,
+-      headless?"--headless=new":(char*)0, headless?"--hide-scrollbars":(char*)0, headless?uaf:(char*)0,
+-      (char*)0);
++      dldir}; int ac=13;
++    if(g_app && g_app_mute) av[ac++]="--mute-audio";   /* app mode: the app's own sounds never play */
++    if(headless){ av[ac++]="--headless=new"; av[ac++]="--hide-scrollbars"; av[ac++]=uaf; }
++    av[ac]=NULL;
++    execv(bin,(char *const *)av);
+     _exit(127);
+   }
+   g_chrome=pid;
+@@ -948,6 +967,7 @@ static int wait_port(int port, int ms){
+ static char g_profile[512]; static int g_want=1, g_bidiport;
+ static void browser_stop(void){
+   if(g_screencast_on) cdp_screencast(0);
++  app_bws_close();
+   if(g_ws>=0){ close(g_ws); g_ws=-1; }
+   if(g_bcon>=0){ close(g_bcon); g_bcon=-1; }
+   if(g_chrome>0){ pid_t pid=g_chrome; kill(pid,SIGTERM); /* our own child only, by its PID */
+@@ -1023,6 +1043,7 @@ int main(int argc, char **argv){
+   signal(SIGCHLD,SIG_IGN);
+ 
+   g_dbg=dbg; if(!g_bidiport) g_bidiport=dbg+100;
++  app_init(); if(g_app){ g_want=1; if(g_app_mute) setenv("ASB_AUDIO","0",1); }   /* app mode: Chrome only; muted = no audio sink */
+   feat_init(asbc);
+   const char *dlenv=getenv("ASB_DOWNLOADS");
+   if(dlenv&&dlenv[0]) snprintf(g_dlpath,sizeof g_dlpath,"%s",dlenv);
+@@ -1041,7 +1062,7 @@ int main(int argc, char **argv){
+   if(browser_start(g_want)){
+     if(g_want==2){ fprintf(stderr,"asb-chromed: Firefox failed to start, using Chrome\n"); browser_stop(); if(browser_start(1)) return 1; }
+     else return 1; }
+-  if(start) cdp_nav(start);
++  if(start) cdp_nav(start); else if(g_app) cdp_nav(g_app_url);
+   fprintf(stderr,"asb-chromed: ASBC on 127.0.0.1:%d\n",asbc);
+   send_status("waiting for client");
+ 
+@@ -1055,12 +1076,13 @@ int main(int argc, char **argv){
+     if(g_cli>=0){ FD_SET(g_cli,&rf); if(g_cli>m) m=g_cli; }
+     if(g_pagefd>=0){ FD_SET(g_pagefd,&rf); if(g_pagefd>m) m=g_pagefd; }
+     if(g_au_fd>=0){ FD_SET(g_au_fd,&rf); if(g_au_fd>m) m=g_au_fd; }
++    if(g_bws>=0){ FD_SET(g_bws,&rf); if(g_bws>m) m=g_bws; }
+     struct timeval tv={0,20000};
+     int n=select(m+1,&rf,NULL,NULL,&tv);
+     if(n<0){ if(errno==EINTR) continue; break; }
+     if(g_chrome>0){ int st; waitpid(g_chrome,&st,WNOHANG); }
+     stats_send(); audio_pump(); vq_pump();
+-    bidi_cast_tick(); kick_tick();
++    bidi_cast_tick(); kick_tick(); app_tick();
+     if(g_idle_min>0){ static long long since; long long t=now_ms();
+       if(g_cli>=0) since=0; else if(!since) since=t;
+       else if(t-since>(long long)g_idle_min*60000){ fprintf(stderr,"asb-chromed: no client for %d min, exiting\n",g_idle_min); browser_stop(); return 0; } }
+@@ -1100,6 +1122,7 @@ int main(int argc, char **argv){
+         on_client(op,msg,k);
+       }
+     }
++    if(g_bws>=0 && FD_ISSET(g_bws,&rf)) app_bws_read();
+     if(g_ws>=0 && FD_ISSET(g_ws,&rf)){
+       int k=ws_recv(g_ws,&wsbuf);
+       if(k<0){ fprintf(stderr,"asb-chromed: chrome ws closed\n"); close(g_ws); g_ws=-1; g_screencast_on=0; }

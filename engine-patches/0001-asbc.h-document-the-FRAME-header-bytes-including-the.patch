@@ -1,0 +1,38 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: "Grok Bot (for Rich)" <hardcopi@users.noreply.github.com>
+Date: Sat, 17 Oct 2026 22:18:31 -0400
+Subject: [PATCH] asbc.h: document the FRAME header bytes, including the
+ pixel-format byte of fmt 3 tiles
+
+The FRAME comment said 'u8 fmt (2=qoi), data' and the fmt 3 comment started at the comp byte,
+leaving out the u8 pixfmt at offset 13 that send_tile() writes (p[13]=g_pf, p[14]=comp, data at 15).
+Comment-only change.
+---
+ chrome/asbc.h | 7 +++++--
+ 1 file changed, 5 insertions(+), 2 deletions(-)
+
+diff --git a/chrome/asbc.h b/chrome/asbc.h
+index 9c78d2b..2f90e61 100644
+--- a/chrome/asbc.h
++++ b/chrome/asbc.h
+@@ -37,7 +37,9 @@ enum {
+                        Sent once after HELLO; from then on FRAME tiles come as fmt 3 (raw, client pixel format). */
+   ASBC_AUDIOCTL=21, /* u8 1 play 0 mute (client -> host; host stops streaming while muted) */
+   ASBC_ACK    = 20, /* empty: one frame/scroll applied (only when ASBC_FF_ACK was announced) */
+-  ASBC_FRAME  = 32, /* u16 cssw,cssh, x,y,tw,th, u8 fmt (2=qoi), data */
++  ASBC_FRAME  = 32, /* u16 cssw,cssh, x,y,tw,th (offsets 0-11), u8 fmt (offset 12), then by fmt:
++                       fmt 1 = PNG, fmt 2 = QOI: u8 0 (offset 13, reserved), data from offset 14;
++                       fmt 3 = raw: u8 pixfmt (offset 13, ASBC_PF_* of this tile), u8 comp (offset 14), data from 15 */
+   ASBC_META   = 33, /* u8 flags (1 back 2 fwd 4 loading), u16 nurl, url, u16 ntitle, title */
+   ASBC_CURSOR = 34, /* u8 0 arrow 1 ibeam 2 hand 3 wait */
+   ASBC_STATUS = 35, /* utf-8 */
+@@ -54,7 +56,8 @@ enum {
+   ASBC_SCROLL = 43  /* u16 x,y,w,h, i16 dy: move that page area by dy (content moves up when dy<0) */
+ };
+ 
+-/* FRAME fmt 3 payload: u8 comp (0 raw, 1 RLE) then tw*th pixels in the client's format.
++/* FRAME fmt 3 payload (after the 12 header bytes and fmt=3): u8 pixfmt (ASBC_PF_*, the format announced with ASBC_FMT),
++   u8 comp (0 raw, 1 RLE), then tw*th pixels in that format (asbc_pf_bpp bytes each).
+    RLE per pixel: c<128 -> c+1 literal pixels follow; c>=128 -> next pixel repeated c-126 times (2..129). */
+ enum { ASBC_PF_QOI=0, ASBC_PF_RGB24=1, ASBC_PF_RGB565=2, ASBC_PF_RGB565PC=3, ASBC_PF_RGB555=4, ASBC_PF_RGB555PC=5,
+        ASBC_PF_ARGB32=6, ASBC_PF_BGRA32=7, ASBC_PF_RGBA32=8, ASBC_PF_CLUT8=9, ASBC_PF_BGR24=10, ASBC_PF_ABGR32=11,

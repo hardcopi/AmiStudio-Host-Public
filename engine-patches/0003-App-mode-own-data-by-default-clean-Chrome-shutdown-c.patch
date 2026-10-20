@@ -1,0 +1,160 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: "Grok Bot (for Rich)" <hardcopi@users.noreply.github.com>
+Date: Sat, 17 Oct 2026 22:49:21 -0400
+Subject: [PATCH] App mode: own data by default, clean Chrome shutdown, cmd app
+ logout
+
+In app mode asb-chromed no longer falls back to AmiSurf's store: without
+ASB_CONFIG / -profile it uses ~/.config/amisurf-app-<app> and
+~/.config/amistudio-chrome-<app>.
+
+SIGTERM/SIGINT in app mode sets a flag; the main loop then closes Chrome
+with Browser.close and waits (up to 15 s) so cookies and localStorage -
+the web app's login - are written. The idle exit takes the same path.
+AmiSurf mode keeps the old immediate exit.
+
+'cmd app logout' clears cookies, cache and all storage of the allowlisted
+origins and returns to the start URL.
+---
+ chrome/appmode.inc  | 33 +++++++++++++++++++++++++++++++++
+ chrome/features.inc |  1 +
+ chrome/host.c       | 14 ++++++++++----
+ 3 files changed, 44 insertions(+), 4 deletions(-)
+
+diff --git a/chrome/appmode.inc b/chrome/appmode.inc
+index 3198e7e..bcb3779 100644
+--- a/chrome/appmode.inc
++++ b/chrome/appmode.inc
+@@ -16,6 +16,9 @@
+      ASB_APP_DARK       1: also emulate prefers-color-scheme: dark
+      ASB_APP_MUTE       1 (default): Chrome runs with --mute-audio, so the app's own sounds never play (the client
+                         plays its own notification sounds)
++   Data: Chrome's profile (-profile; default ~/.config/amistudio-chrome-<app>) and ASB_CONFIG (default
++   ~/.config/amisurf-app-<app>) are the app's own, never AmiSurf's. On SIGTERM Chrome is closed with Browser.close
++   so the login (cookies, localStorage) is written; "cmd app logout" clears it.
+    In app mode there are no tabs, no asb:// pages, no bookmarks/history/suggestions, no password manager and no
+    save page/source/PDF. Client NAV is accepted for allowlisted hosts only. */
+ 
+@@ -183,6 +186,7 @@ static int app_cmd(char *c,char *arg){
+     char *v=strchr(arg,' '); if(v) *v++=0; else v="";
+     if(!strcmp(arg,"home")) cdp_nav(g_app_url);
+     else if(!strcmp(arg,"reducedmotion")) app_set_rm(atoi(v));
++    else if(!strcmp(arg,"logout")) app_logout();
+     else fprintf(stderr,"asb-chromed: app: unknown command app %s\n",arg);
+     return 1; }
+   fprintf(stderr,"asb-chromed: app mode: cmd %s ignored\n",c); return 1; }
+@@ -207,6 +211,35 @@ static int app_event(const char *method,const char *msg){
+     return 1; }
+   return 0; }
+ 
++/* ---- clean shutdown (M2): Browser.close lets Chrome write the profile (cookies, localStorage = the app's login);
++   a plain SIGTERM to Chrome, or SIGKILL after it, can drop the last writes. Called from browser_stop(). ---- */
++static void app_close_chrome(void){
++  if(!g_app || g_bidi || g_chrome<=0) return;
++  pid_t pid=g_chrome;
++  if(g_bws<0) app_bws_open();
++  int sent=g_bws>=0 && bcdp("{\"id\":%d,\"method\":\"Browser.close\"}",cdp_id())==0;
++  if(!sent && g_ws>=0) sent=cdp("{\"id\":%d,\"method\":\"Browser.close\"}",cdp_id())==0;
++  long long t0=now_ms();
++  while(sent && kill(pid,0)==0 && now_ms()-t0<15000) usleep(50000);   /* SIGCHLD is ignored: the child is reaped by itself */
++  if(kill(pid,0)==0) fprintf(stderr,"asb-chromed: app: Chrome did not close in time, terminating it\n");
++  else { fprintf(stderr,"asb-chromed: app: Chrome closed cleanly (%lld ms)\n",now_ms()-t0); g_chrome=0; }
++  if(g_ws>=0){ close(g_ws); g_ws=-1; } }
++
++/* ---- "cmd app logout": forget this Amiga's login - all storage of the allowlisted origins and every cookie of the
++   app's own profile, then the start page ---- */
++static void clear_origin(const char *origin){
++  char e[400]; jesc(origin,e,sizeof e);
++  cdp("{\"id\":%d,\"method\":\"Storage.clearDataForOrigin\",\"params\":{\"origin\":\"%s\",\"storageTypes\":\"all\"}}",cdp_id(),e); }
++static void app_logout(void){
++  char o[300]; int n=0;
++  for(int i=0;i<g_app_nallow;i++){ const char *p=g_app_allow[i]; if(p[0]=='*' && p[1]=='.') p+=2;   /* *.x.com: at least x.com */
++    snprintf(o,sizeof o,"https://%.280s",p); clear_origin(o); snprintf(o,sizeof o,"http://%.280s",p); clear_origin(o); n++; }
++  origin_of(g_url,o,sizeof o); if(o[0]) clear_origin(o);
++  cdp("{\"id\":%d,\"method\":\"Network.clearBrowserCookies\"}",cdp_id());
++  cdp("{\"id\":%d,\"method\":\"Network.clearBrowserCache\"}",cdp_id());
++  fprintf(stderr,"asb-chromed: app: logged out (storage of %d allowed hosts + %s cleared, all cookies)\n",n,o);
++  cdp_nav(g_app_url); send_status("Logged out"); }
++
+ /* every main-loop pass (20 ms) */
+ static void app_tick(void){
+   if(!g_app) return;
+diff --git a/chrome/features.inc b/chrome/features.inc
+index 45b0ec4..e2f352c 100644
+--- a/chrome/features.inc
++++ b/chrome/features.inc
+@@ -594,6 +594,7 @@ static void feat_enable(void){ /* per attached tab: 0.78 injects nothing into pa
+ static void feat_init(int asbcport){
+   const char *e=getenv("ASB_CONFIG"); const char *home=getenv("HOME"); if(!home) home="/tmp";
+   if(e&&e[0]) scopy(g_cfg,sizeof g_cfg,e);
++  else if(g_app) snprintf(g_cfg,sizeof g_cfg,"%s/.config/amisurf-app-%s",home,g_app_id);   /* app mode: never AmiSurf's store */
+   else { struct stat st; char old[620]; snprintf(g_cfg,sizeof g_cfg,"%s/.config/amisurf",home); snprintf(old,sizeof old,"%s/.config/amistudio-browser",home);
+     if(stat(g_cfg,&st) && !stat(old,&st) && S_ISDIR(st.st_mode)){ scopy(g_cfg,sizeof g_cfg,old); fprintf(stderr,"asb-chromed: using the old data folder %s (AmiStudio Browser); rename it to ~/.config/amisurf when you no longer need 0.81\n",g_cfg); } }
+   { char p[620]; snprintf(p,sizeof p,"%s/.config",home); mkdir(p,0755); } mkdir(g_cfg,0700);
+diff --git a/chrome/host.c b/chrome/host.c
+index 49d905a..3e81fb8 100644
+--- a/chrome/host.c
++++ b/chrome/host.c
+@@ -55,6 +55,8 @@ static void bidi_from_cdp(const char *cmd); static int bidi_tree(void); static i
+ static int g_app; static void app_enable(void); static int app_cmd(char *c,char *arg); static int app_nav(const char *u);
+ static int app_event(const char *method,const char *msg); static int app_hold(unsigned char *rgb,int iw,int ih);
+ static void app_tick(void); static void app_init(void); static void app_bws_read(void); static void app_bws_close(void);
++static void app_close_chrome(void); static void app_logout(void);
++static char g_app_id[64];   /* tentative; defined in appmode.inc */
+ 
+ /* ---- growable buffer ---- */
+ typedef struct { char *p; int n, cap; } buf_t;
+@@ -952,7 +954,8 @@ static int spawn_chrome(const char *profile, int dbgport){
+ }
+ 
+ static void audio_cleanup(void);
+-static void die_chrome(int sig){ (void)sig; if(g_chrome>0) kill(g_chrome,SIGTERM); audio_cleanup(); _exit(0); }
++static volatile sig_atomic_t g_quit;   /* app mode: SIGTERM/SIGINT -> clean shutdown in the main loop (app_quit) */
++static void die_chrome(int sig){ (void)sig; if(g_app){ g_quit=1; return; } if(g_chrome>0) kill(g_chrome,SIGTERM); audio_cleanup(); _exit(0); }
+ 
+ static int wait_port(int port, int ms){
+   int t0=0;
+@@ -967,6 +970,7 @@ static int wait_port(int port, int ms){
+ static char g_profile[512]; static int g_want=1, g_bidiport;
+ static void browser_stop(void){
+   if(g_screencast_on) cdp_screencast(0);
++  app_close_chrome();   /* app mode: Browser.close and wait, so Chrome writes cookies/localStorage (the login) */
+   app_bws_close();
+   if(g_ws>=0){ close(g_ws); g_ws=-1; }
+   if(g_bcon>=0){ close(g_bcon); g_bcon=-1; }
+@@ -1020,7 +1024,7 @@ int main(int argc, char **argv){
+   int dbg=9222, asbc=ASBC_PORT;
+   const char *home=getenv("HOME"); if(!home) home="/tmp";
+   char profile[512]; snprintf(profile,sizeof profile,"%s/.config/amistudio-chrome",home);
+-  const char *start=NULL, *bindaddr=NULL, *token=getenv("ASB_TOKEN");
++  const char *start=NULL, *bindaddr=NULL, *token=getenv("ASB_TOKEN"); int profile_set=0;
+   for(int i=1;i<argc;i++){
+     if(!strcmp(argv[i],"-port")&&i+1<argc) asbc=atoi(argv[++i]);
+     else if(!strcmp(argv[i],"-cdp")&&i+1<argc) dbg=atoi(argv[++i]);
+@@ -1032,7 +1036,7 @@ int main(int argc, char **argv){
+       fprintf(stderr,"usage: asb-chromed [-browser chrome|firefox] [-port 9223] [-cdp 9222] [-bidi 9322] [-profile DIR] [-idle MIN] [-listen ADDR -token SECRET] [URL]\n"
+         "  default: ASBC on 127.0.0.1 only. -listen 0.0.0.0 (or a LAN address) needs -token (or ASB_TOKEN).\n"); return 0; }
+     else if(!strcmp(argv[i],"-idle")&&i+1<argc) g_idle_min=atoi(argv[++i]);
+-    else if(!strcmp(argv[i],"-profile")&&i+1<argc) snprintf(profile,sizeof profile,"%s",argv[++i]);
++    else if(!strcmp(argv[i],"-profile")&&i+1<argc){ snprintf(profile,sizeof profile,"%s",argv[++i]); profile_set=1; }
+     else if(argv[i][0]!='-') start=argv[i];
+   }
+   if(bindaddr && strcmp(bindaddr,"127.0.0.1") && (!token || strlen(token)<8)){
+@@ -1043,7 +1047,8 @@ int main(int argc, char **argv){
+   signal(SIGCHLD,SIG_IGN);
+ 
+   g_dbg=dbg; if(!g_bidiport) g_bidiport=dbg+100;
+-  app_init(); if(g_app){ g_want=1; if(g_app_mute) setenv("ASB_AUDIO","0",1); }   /* app mode: Chrome only; muted = no audio sink */
++  app_init(); if(g_app){ g_want=1; if(g_app_mute) setenv("ASB_AUDIO","0",1);   /* app mode: Chrome only; muted = no audio sink */
++    if(!profile_set) snprintf(profile,sizeof profile,"%s/.config/amistudio-chrome-%s",home,g_app_id); }   /* never AmiSurf's profile */
+   feat_init(asbc);
+   const char *dlenv=getenv("ASB_DOWNLOADS");
+   if(dlenv&&dlenv[0]) snprintf(g_dlpath,sizeof g_dlpath,"%s",dlenv);
+@@ -1079,6 +1084,7 @@ int main(int argc, char **argv){
+     if(g_bws>=0){ FD_SET(g_bws,&rf); if(g_bws>m) m=g_bws; }
+     struct timeval tv={0,20000};
+     int n=select(m+1,&rf,NULL,NULL,&tv);
++    if(g_quit){ fprintf(stderr,"asb-chromed: app: stopping (signal); closing Chrome cleanly\n"); close_cli(); browser_stop(); audio_cleanup(); return 0; }
+     if(n<0){ if(errno==EINTR) continue; break; }
+     if(g_chrome>0){ int st; waitpid(g_chrome,&st,WNOHANG); }
+     stats_send(); audio_pump(); vq_pump();
